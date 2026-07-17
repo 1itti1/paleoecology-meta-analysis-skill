@@ -535,7 +535,7 @@ def dual_indicator_check(
     Parameters
     ----------
     data : pd.DataFrame
-        花粉百分比数据。
+        分类群百分比数据（花粉、硅藻、有孔虫等）。
     indicator_set_a : dict
         第一套指标分组（如基于 Ellenberg 光指数）。
     indicator_set_b : dict

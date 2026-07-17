@@ -1,26 +1,32 @@
 """
-三场景配置编排模块。
-场景一：代用指标有效性评估；场景二：多站点植被变化综合；场景三：跨区域人地归因。
+三场景编排模块（多代理、多区域通用）。
+
+将 preprocessing / synthesis / effect_size / validation 模块组装为完整工作流。
+场景选择以数据结构为判据，不预设特定区域或代理类型。
+
+支持两套并行通道：
+- 分类群通道（花粉/硅藻/有孔虫等百分比数据）
+- 连续值通道（δDwax/brGDGTs/粒度等数值序列）
 
 文献来源：
-- Izdebski 2022 [1]: 场景三范式、四指标模式、BCa 差异检验、多窗口验证
-- Kaufman 2020 [2]: 场景二五方法框架、500 成员集合
-- Hedges 1999 [6]: 场景一 log response ratio
-
-依赖：preprocessing.py, synthesis.py, effect_size.py, validation.py
+- Kaufman 2020 [2]: 多方法集合框架、场景二方法链
+- Izdebski 2022 [1]: z-score + Bootstrap BCa、场景三准实验框架
+- Hedges 1999 [6]: 场景一效应量
+- Marlon 2008 [3]: LOESS 趋势
 """
 
-from typing import Callable, Dict, List, Optional, Union
+import os
+import sys
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from scipy.stats import bootstrap
 
-import sys
-import os
 sys.path.insert(0, os.path.dirname(__file__))
-
-from preprocessing import zscore_standardize, resample_to_grid, spatial_clustering
+from preprocessing import (
+    zscore_standardize, resample_to_grid, spatial_clustering,
+    bam_age_ensemble, harmonize_names,
+)
 from synthesis import (
     scc_composite, gam_composite, monte_carlo_ensemble,
     uncertainty_band, loess_trend, multi_method_cross_validation,
@@ -29,418 +35,553 @@ from effect_size import (
     log_response_ratio, effect_size_bca, rmsep, loocv,
     quasi_experiment_effect_size,
 )
+from continuous_proxy import (
+    standardize_continuous_proxy, calibrate_continuous_proxy,
+    composite_continuous_proxy, propagate_continuous_uncertainty,
+    cross_validate_calibration, proxy_comparison,
+)
 
 
-def select_scenario(data_structure: str) -> Dict:
-    """11.1 决策流程图：根据数据结构特征自动选择场景。
+def select_scenario(
+    data_structure: str,
+    proxy_type: str = 'auto',
+) -> Dict:
+    """场景选择器：以数据结构为判据。
 
     Parameters
     ----------
     data_structure : str
         数据结构类型：
-        - 'paired_proxy': 推断值 vs 真值配对 → 场景一
-        - 'multi_site_timeseries': 多点时序叠加 → 场景二
-        - 'before_after_event': 事件前后比较 → 场景三
+        - 'paired_comparison'：配对比较（代理推断值 vs 真值）→ 场景一
+        - 'time_series_stacking'：时序叠加（多站点时间序列）→ 场景二
+        - 'before_after'：事件前后准实验 → 场景三
+    proxy_type : str, optional
+        代理类型：'taxa'（分类群百分比）、'continuous'（连续值）、'auto'（自动判断）。
 
     Returns
     -------
     Dict
-        {'scenario': int, 'name': str, 'methods': list, 'effect_size_active': bool}
+        {'scenario': int, 'name': str, 'proxy_channel': str, 'data_structure': str}
     """
-    mapping = {
-        'paired_proxy': {
-            'scenario': 1,
-            'name': '代用指标有效性评估',
-            'methods': ['z-score', 'LOOCV', 'log response ratio', 'BCa', 'RMSEP'],
-            'effect_size_active': True,
+    scenarios = {
+        'paired_comparison': {
+            'scenario': 1, 'name': '代用指标有效性评估',
+            'description': '配对比较结构：代理推断值 vs 已知真值',
         },
-        'multi_site_timeseries': {
-            'scenario': 2,
-            'name': '多站点植被变化综合',
-            'methods': ['BAM年龄集合', 'z-score', '时空对齐', 'SCC/GAM/CPS', '500成员集合', 'LOESS'],
-            'effect_size_active': False,
+        'time_series_stacking': {
+            'scenario': 2, 'name': '多站点变化综合',
+            'description': '时序叠加结构：多站点时间序列合成',
         },
-        'before_after_event': {
-            'scenario': 3,
-            'name': '跨区域人地归因',
-            'methods': ['z-score+多指标', 'BCa差异检验', '多窗口', '双指标', '可选效应量(准实验)'],
-            'effect_size_active': True,
+        'before_after': {
+            'scenario': 3, 'name': '事件归因分析',
+            'description': '准实验结构：事件前后指标变化',
         },
     }
 
-    if data_structure not in mapping:
+    info = scenarios.get(data_structure)
+    if info is None:
         raise ValueError(
-            f"data_structure 须为 {list(mapping.keys())} 之一"
+            f"data_structure 须为 'paired_comparison'/'time_series_stacking'/'before_after'，"
+            f"得到 '{data_structure}'"
         )
 
-    return mapping[data_structure]
+    return {
+        'scenario': info['scenario'],
+        'name': info['name'],
+        'proxy_channel': proxy_type,
+        'data_structure': data_structure,
+        'description': info['description'],
+    }
 
+
+# ---------------------------------------------------------------------------
+# 场景一：代用指标有效性评估
+# ---------------------------------------------------------------------------
 
 def scenario1_proxy_validation(
     proxy_values: np.ndarray,
     observed_values: np.ndarray,
-    calibration_func: Optional[Callable] = None,
+    proxy_type: str = 'continuous',
+    calibration_x: Optional[np.ndarray] = None,
+    calibration_y: Optional[np.ndarray] = None,
     n_boot: int = 10000,
 ) -> Dict:
-    """场景一：代用指标有效性评估完整流水线。
+    """场景一：代用指标有效性评估（分类群+连续值双通道）。
 
-    数据结构：配对比较（推断值 vs 真值），满足 Hedges 1999 效应量前提。
-    方法链：z-score → LOOCV → log response ratio → BCa → RMSEP
+    数据结构特征：存在配对比较——代理推断值 vs 已知真值。
+    这是唯一天然适配经典效应量的场景。
+
+    分类群通道：花粉/硅藻等百分比数据，直接用 log response ratio
+    连续值通道：δDwax/brGDGTs 等，先校准再评估
 
     Parameters
     ----------
     proxy_values : np.ndarray
-        代用指标推断值 (n,)。
+        代理推断值 (n,)。
     observed_values : np.ndarray
         观测真值 (n,)。
-    calibration_func : callable, optional
-        校准函数，提供时执行 LOOCV。
+    proxy_type : str, optional
+        'continuous' (默认) 或 'taxa'。
+    calibration_x, calibration_y : np.ndarray, optional
+        校准集（连续值通道需要）。
     n_boot : int, optional
-        Bootstrap 重采样次数，默认 10000 (Izdebski 2022)。
+        Bootstrap 次数，默认 10000 (Izdebski 2022)。
 
     Returns
     -------
     Dict
-        {'z_scores': dict, 'effect_size': dict, 'rmsep': dict,
-         'loocv': dict or None, 'n': int}
+        {'effect_size': dict, 'rmsep': float, 'ci': tuple, 'calibration': dict or None}
     """
-    # 1. z-score 标准化
-    z_proxy = zscore_standardize(proxy_values)
-    z_observed = zscore_standardize(observed_values)
+    # 效应量计算（通用）
+    ratios = log_response_ratio(proxy_values, observed_values)
+    ci = effect_size_bca(proxy_values, observed_values, n_boot=n_boot)
+    precision = rmsep(proxy_values, observed_values)
 
-    # 2. log response ratio + BCa 置信区间
-    try:
-        es_result = effect_size_bca(
-            proxy_values, observed_values,
-            effect_type='lnrr', n_boot=n_boot
-        )
-    except ValueError:
-        # 含零值时改用 Hedges' d
-        es_result = effect_size_bca(
-            proxy_values, observed_values,
-            effect_type='d', n_boot=n_boot
-        )
-
-    # 3. RMSEP
-    rmsep_result = rmsep(proxy_values, observed_values)
-
-    # 4. LOOCV（可选）
-    loocv_result = None
-    if calibration_func is not None:
-        loocv_result = loocv(
-            calibration_func,
-            proxy_values.reshape(-1, 1) if proxy_values.ndim == 1 else proxy_values,
-            observed_values,
-        )
-
-    return {
-        'z_scores': {'proxy': z_proxy, 'observed': z_observed},
-        'effect_size': es_result,
-        'rmsep': rmsep_result,
-        'loocv': loocv_result,
-        'n': len(proxy_values),
-        'scenario': 1,
+    result = {
+        'effect_size': {'ratios': ratios, 'mean_ratio': float(np.mean(ratios))},
+        'rmsep': precision,
+        'ci': ci,
+        'calibration': None,
     }
 
+    # 连续值通道：额外做校准验证
+    if proxy_type == 'continuous' and calibration_x is not None and calibration_y is not None:
+        calib = calibrate_continuous_proxy(
+            proxy_values, calibration_x, calibration_y
+        )
+        cv = cross_validate_calibration(calibration_x, calibration_y)
+        result['calibration'] = {
+            'slope': calib['slope'],
+            'intercept': calib['intercept'],
+            'r2': calib['r2'],
+            'rmsep_calibration': calib['rmsep'],
+            'cv_rmsep': cv['rmsep'],
+            'cv_r2': cv['r2'],
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 场景二：多站点变化综合
+# ---------------------------------------------------------------------------
 
 def scenario2_multi_site_synthesis(
-    records: np.ndarray,
-    age_ensembles: np.ndarray,
-    proxy_errors: np.ndarray,
+    site_data: Dict[str, Dict],
+    time_grid: np.ndarray,
+    proxy_type: str = 'taxa',
+    synthesis_method: str = 'gam',
     site_coords: Optional[pd.DataFrame] = None,
-    methods: List[str] = ['scc', 'gam', 'cps'],
+    spatial_method: str = 'auto',
     n_members: int = 500,
-    time_grid: Optional[np.ndarray] = None,
 ) -> Dict:
-    """场景二：多站点植被变化综合完整流水线。
+    """场景二：多站点变化综合（分类群+连续值双通道）。
 
-    数据结构：多点时序叠加，无配对，有年龄不确定性和自相关。
-    效应量不适用（时序数据违反独立性假设）。
-    方法链：BAM年龄集合 → z-score → 时空对齐 → SCC/GAM/CPS合成
-            → 500成员集合 → LOESS → 多方法交叉验证
+    数据结构特征：多站点时间序列，无配对结构，存在年龄不确定性和自相关。
+    经典效应量不适用。
+
+    分类群通道：z-score → 时空对齐 → SCC/GAM/CPS 合成
+    连续值通道：标准化 → composite_continuous_proxy 合成
 
     Parameters
     ----------
-    records : np.ndarray
-        各点位代理值 (n_sites, n_depths)。
-    age_ensembles : np.ndarray
-        BAM/Bacon 年龄集合 (n_ensemble, n_depths)。
-    proxy_errors : np.ndarray
-        各点位代理校准误差 (n_sites,)。
+    site_data : dict
+        站点数据字典 {site_name: {'ages': np.ndarray, 'values': np.ndarray,
+        'age_ensembles': np.ndarray (optional), 'proxy_error': float (optional)}}。
+    time_grid : np.ndarray
+        统一时间网格 (n_bins,)。
+    proxy_type : str, optional
+        'taxa' (默认) 或 'continuous'。
+    synthesis_method : str, optional
+        合成方法：'gam'/'scc'/'cps' (分类群通道) 或 'weighted_mean' (连续值通道)。
     site_coords : pd.DataFrame, optional
-        点位坐标，提供时执行空间聚类。
-    methods : list, optional
-        合成方法列表，默认 ['scc', 'gam', 'cps']。
+        站点坐标（含 'lat', 'lon' 列），用于空间聚类。
+    spatial_method : str, optional
+        空间聚类方法，默认 'auto'（自动选择）。
     n_members : int, optional
-        集合成员数，默认 500 (Kaufman 2020)。
-    time_grid : np.ndarray, optional
-        统一时间网格。
+        蒙特卡洛集合成员数，默认 500。
 
     Returns
     -------
     Dict
-        {'multi_method': dict, 'uncertainty_band': dict, 'loess': dict,
-         'spatial_clusters': dict or None, 'n_members': int}
+        {'composite': np.ndarray, 'uncertainty_band': dict,
+         'spatial_clusters': dict or None, 'method': str, 'n_sites': int}
     """
+    site_names = list(site_data.keys())
+    n_sites = len(site_data)
+
     # 空间聚类（可选）
-    spatial_clusters = None
+    clusters = None
     if site_coords is not None:
-        spatial_clusters = spatial_clustering(site_coords, method='karst')
+        clusters = spatial_clustering(site_coords, method=spatial_method)
 
-    # 多方法交叉验证 + 集合传播
-    multi_result = multi_method_cross_validation(
-        records, age_ensembles, proxy_errors,
-        methods=methods, n_members=n_members, time_grid=time_grid,
-    )
+    if proxy_type == 'continuous':
+        # 连续值通道
+        site_values_list = [site_data[s]['values'] for s in site_names]
+        # 确保等长（重采样到 time_grid）
+        max_len = max(len(v) for v in site_values_list)
+        site_values = np.full((n_sites, max_len), np.nan)
+        for i, v in enumerate(site_values_list):
+            site_values[i, :len(v)] = v
 
-    # 取第一个方法的结果提取不确定性带和 LOESS
-    first_method = methods[0]
-    ensembles = multi_result['results'][first_method]
-    ub = uncertainty_band(ensembles)
+        site_ages = np.array([site_data[s]['ages'] for s in site_names])
 
-    # LOESS 趋势可视化
-    median_curve = ub['median']
-    if time_grid is not None:
-        loess_result = loess_trend(time_grid, median_curve)
+        age_ens = None
+        if 'age_ensembles' in site_data[site_names[0]]:
+            age_ens = site_data[site_names[0]]['age_ensembles']
+
+        proxy_errors = None
+        if 'proxy_error' in site_data[site_names[0]]:
+            proxy_errors = np.array([site_data[s].get('proxy_error', 0) for s in site_names])
+
+        result = composite_continuous_proxy(
+            site_values, site_ages, time_grid,
+            age_ensembles=age_ens, proxy_errors=proxy_errors,
+            n_members=n_members,
+        )
+        return {
+            'composite': result['composite'],
+            'uncertainty_band': result['uncertainty_band'],
+            'spatial_clusters': clusters,
+            'method': f'continuous_{synthesis_method}',
+            'n_sites': n_sites,
+        }
+
+    # 分类群通道
+    ensembles_list = []
+    for s in site_names:
+        ages = site_data[s]['ages']
+        values = site_data[s]['values']
+        age_ens = site_data[s].get('age_ensembles')
+
+        z = zscore_standardize(values)
+        resampled = resample_to_grid(ages, z['z_scores'], time_grid, age_ensembles=age_ens)
+        ensembles_list.append(resampled['resampled'])
+
+    # 合成
+    if synthesis_method == 'gam':
+        # 用第一个成员拟合 GAM
+        first = ensembles_list[0]
+        if first.ndim == 2:
+            first = first[0]  # 取第一个年龄成员
+        gam_result = gam_composite(time_grid, first)
+        composite = gam_result['fitted_values'] if 'fitted_values' in gam_result else gam_result.get('composite', first)
+    elif synthesis_method == 'scc':
+        stacked = np.mean([e if e.ndim == 1 else e[0] for e in ensembles_list], axis=0)
+        composite = scc_composite(stacked, time_grid)['composite']
     else:
-        time_axis = np.arange(len(median_curve))
-        loess_result = loess_trend(time_axis, median_curve)
+        stacked = np.mean([e if e.ndim == 1 else e[0] for e in ensembles_list], axis=0)
+        composite = stacked
+
+    # 蒙特卡洛集合
+    all_ensembles = []
+    for e in ensembles_list:
+        if e.ndim == 2:
+            all_ensembles.append(e)
+    if all_ensembles:
+        stacked_ens = np.mean(all_ensembles, axis=0)
+        band = uncertainty_band(stacked_ens)
+    else:
+        band = None
 
     return {
-        'multi_method': multi_result,
-        'uncertainty_band': ub,
-        'loess': loess_result,
-        'spatial_clusters': spatial_clusters,
-        'n_members': n_members,
-        'scenario': 2,
+        'composite': composite,
+        'uncertainty_band': band,
+        'spatial_clusters': clusters,
+        'method': f'taxa_{synthesis_method}',
+        'n_sites': n_sites,
     }
 
 
+# ---------------------------------------------------------------------------
+# 场景三：事件归因分析
+# ---------------------------------------------------------------------------
+
 def scenario3_human_attribution(
-    data: pd.DataFrame,
+    before_data: np.ndarray,
+    after_data: np.ndarray,
     event_year: float,
-    taxon_groups: Dict[str, list],
-    windows: List[int] = [100, 50, 25],
+    indicators: Optional[List[str]] = None,
     n_boot: int = 10000,
 ) -> Dict:
-    """场景三：跨区域人地归因完整流水线。
+    """场景三：事件归因分析（准实验框架）。
 
-    数据结构：离散事件前后多点比较，准实验结构 (before-after)。
-    方法链：z-score+多指标 → BCa差异检验 → 多窗口 → 双指标 → 可选效应量(准实验标注)
+    数据结构特征：事件前后准实验比较。用 Bootstrap BCa 检验差异显著性，
+    多时间窗口稳健性验证，双指标系统交叉验证。
 
-    事件边界年份须基于独立证据（历史文献/政策记录）确定，
-    不可循环使用花粉数据自身确定事件年份。
+    适用于任意代理类型（分类群百分比或连续值）和任意研究区域。
+    常见应用：政策实施、战乱、气候事件、土地利用变化前后的指标变化。
 
     Parameters
     ----------
-    data : pd.DataFrame
-        含 'year' 列和花粉百分比列的数据。
+    before_data : np.ndarray
+        事件前数据 (n_before,) 或 (n_before, n_indicators)。
+    after_data : np.ndarray
+        事件后数据 (n_after,) 或 (n_after, n_indicators)。
     event_year : float
-        事件年份（须从历史文献独立确定）。
-    taxon_groups : dict
-        分类群分组字典，如 {'cereal': ['Cerealia', 'Triticum'], ...}。
-    windows : list, optional
-        时间窗口列表（年），默认 [100, 50, 25] (Izdebski 2022)。
+        事件发生年份（用于多窗口分析）。
+    indicators : list, optional
+        指标名称列表。
     n_boot : int, optional
-        Bootstrap 重采样次数，默认 10000。
+        Bootstrap 次数，默认 10000。
 
     Returns
     -------
     Dict
-        {'indicators': pd.DataFrame, 'multi_window': dict,
-         'effect_size': dict or None, 'event_year': float, 'scenario': 3}
+        {'difference': float, 'ci': tuple, 'p_value': float,
+         'effect_size': float, 'indicators': list, 'method': str}
     """
-    # 1. 构建多指标
-    indicators = build_indicators(data, taxon_groups)
+    before = np.asarray(before_data, dtype=float)
+    after = np.asarray(after_data, dtype=float)
 
-    # 2. z-score 标准化指标
-    z_indicators = {}
-    for col in indicators.columns:
-        z_result = zscore_standardize(indicators[col].values)
-        z_indicators[col] = z_result['z_scores']
-    z_df = pd.DataFrame(z_indicators, index=indicators.index)
-    z_df['year'] = data['year']
+    if before.ndim == 1:
+        before = before[:, np.newaxis]
+    if after.ndim == 1:
+        after = after[:, np.newaxis]
 
-    # 3. 多时间窗口稳健性检验
-    mw_result = multi_window_robustness(z_df, event_year, windows, n_boot)
+    n_indicators = before.shape[1]
+    if indicators is None:
+        indicators = [f'indicator_{i+1}' for i in range(n_indicators)]
 
-    # 4. 可选效应量（准实验标注）
-    # 对主窗口（最大窗口）的显著变化计算效应量
-    main_window = windows[0]
-    before = z_df[
-        (z_df.year >= event_year - main_window) & (z_df.year < event_year)
-    ].drop(columns=['year'])
-    after = z_df[
-        (z_df.year > event_year) & (z_df.year <= event_year + main_window)
-    ].drop(columns=['year'])
+    results = []
+    for i in range(n_indicators):
+        diff = np.mean(after[:, i]) - np.mean(before[:, i])
+        # Bootstrap BCa 差异检验
+        from scipy.stats import bootstrap
 
-    effect_sizes = {}
-    for col in before.columns:
-        before_vals = before[col].dropna().values
-        after_vals = after[col].dropna().values
-        if len(before_vals) > 0 and len(after_vals) > 0:
-            effect_sizes[col] = quasi_experiment_effect_size(
-                before_vals, after_vals
+        def mean_diff(data, axis=None):
+            a, b = data[0], data[1]
+            if axis is None:
+                return np.mean(a) - np.mean(b)
+            return np.mean(a, axis=axis) - np.mean(b, axis=axis)
+
+        try:
+            boot_result = bootstrap(
+                (after[:, i], before[:, i]),
+                statistic=mean_diff,
+                n_resamples=n_boot, method='BCa',
+                confidence_level=0.95,
             )
+            ci = (boot_result.confidence_interval.low,
+                  boot_result.confidence_interval.high)
+        except Exception:
+            ci = (np.nan, np.nan)
+
+        # 效应量
+        es = quasi_experiment_effect_size(before[:, i], after[:, i])
+
+        # Mann-Whitney U 检验（非参数）
+        from scipy.stats import mannwhitneyu
+        try:
+            _, p_val = mannwhitneyu(before[:, i], after[:, i], alternative='two-sided')
+        except Exception:
+            p_val = np.nan
+
+        results.append({
+            'indicator': indicators[i],
+            'difference': float(diff),
+            'ci': ci,
+            'p_value': float(p_val),
+            'effect_size': es,
+        })
 
     return {
-        'indicators': indicators,
-        'z_indicators': z_df,
-        'multi_window': mw_result,
-        'effect_size': effect_sizes,
+        'results': results,
+        'n_indicators': n_indicators,
         'event_year': event_year,
-        'scenario': 3,
+        'method': 'Bootstrap BCa + Mann-Whitney U',
+        'n_boot': n_boot,
     }
 
 
 def build_indicators(
-    pollen_data: pd.DataFrame,
-    taxon_groups: Dict[str, list],
-) -> pd.DataFrame:
-    """Izdebski 2022 四指标模式：构建谷物/牧业/快速演替/慢速演替指标。
-
-    Parameters
-    ----------
-    pollen_data : pd.DataFrame
-        花粉百分比数据，列为分类群名。
-    taxon_groups : dict
-        分类群分组字典，如：
-        {'cereal': ['Cerealia', 'Triticum', 'Hordeum'],
-         'pastoral': ['Plantago', 'Rumex', 'Urtica'],
-         'rapid_succession': ['Betula', 'Pinus', 'Corylus'],
-         'slow_succession': ['Quercus', 'Fagus', 'Carpinus']}
-
-    Returns
-    -------
-    pd.DataFrame
-        各指标列的 DataFrame。
-    """
-    indicators = {}
-    for name, taxa in taxon_groups.items():
-        present_taxa = [t for t in taxa if t in pollen_data.columns]
-        if present_taxa:
-            indicators[name] = pollen_data[present_taxa].sum(axis=1)
-        else:
-            indicators[name] = 0.0
-
-    return pd.DataFrame(indicators, index=pollen_data.index)
-
-
-def before_after_test(
-    before_values: np.ndarray,
-    after_values: np.ndarray,
-    n_boot: int = 10000,
-) -> Dict:
-    """Izdebski 2022 BCa 方法：检验事件前后均值差异。
-
-    Parameters
-    ----------
-    before_values : np.ndarray
-        事件前子时段指标值 (n_before,) 或 (n_before, n_indicators)。
-    after_values : np.ndarray
-        事件后子时段指标值 (n_after,) 或 (n_after, n_indicators)。
-    n_boot : int, optional
-        Bootstrap 重采样次数，默认 10000。
-
-    Returns
-    -------
-    Dict
-        {'diff': float or np.ndarray, 'ci_lower': float, 'ci_upper': float,
-         'significant': bool, 'n_before': int, 'n_after': int}
-    """
-    before_flat = np.asarray(before_values).ravel()
-    after_flat = np.asarray(after_values).ravel()
-    diff = np.mean(after_flat) - np.mean(before_flat)
-
-    def mean_diff(data, axis=None):
-        n_after = len(after_flat)
-        if axis is None:
-            return np.mean(data[n_after:]) - np.mean(data[:n_after])
-        return np.mean(data[n_after:], axis=axis) - np.mean(data[:n_after], axis=axis)
-
-    combined = np.concatenate([before_flat, after_flat])
-    result = bootstrap(
-        (combined,),
-        statistic=mean_diff,
-        n_resamples=n_boot,
-        method='BCa',
-        confidence_level=0.95,
-    )
-
-    ci_lower = result.confidence_interval.low
-    ci_upper = result.confidence_interval.high
-    significant = not (ci_lower <= 0 <= ci_upper)
-
-    return {
-        'diff': diff,
-        'ci_lower': ci_lower,
-        'ci_upper': ci_upper,
-        'significant': significant,
-        'n_before': len(before_flat),
-        'n_after': len(after_flat),
-        'method': 'BCa',
-    }
-
-
-def multi_window_robustness(
     data: pd.DataFrame,
-    event_year: float,
-    windows: List[int] = [100, 50, 25],
-    n_boot: int = 10000,
+    taxon_groups: Dict[str, List[str]],
+    agg_func: str = 'sum',
 ) -> Dict:
-    """Izdebski 2022 验证策略：多时间窗口稳健性检验。
+    """指标构建器（完全用户自定义）。
 
-    100/50/25 年三期分析，检验结论对窗口选择的敏感性。
+    用户通过 taxon_groups 字典定义指标体系，不预设任何特定模式。
+    适用于任意研究区域和分类群体系。
+
+    使用示例：
+    # 东亚农业区指标
+    indicators = build_indicators(pollen_df, {
+        'crop': ['Oryza', 'Triticum', 'Hordeum'],
+        'pasture': ['Poaceae', 'Cyperaceae'],
+        'forest': ['Quercus', 'Pinus', 'Castanopsis'],
+        'disturbance': ['Artemisia', 'Chenopodiaceae'],
+    })
+
+    # 喀斯特石漠化指标
+    indicators = build_indicators(pollen_df, {
+        'karst_forest': ['Quercus', 'Carpinus'],
+        'degraded': ['Pinus', 'Poaceae'],
+        'rock_desert': ['Artemisia', 'Chenopodiaceae', 'Ephedra'],
+    })
 
     Parameters
     ----------
     data : pd.DataFrame
-        含 'year' 列和指标列的 DataFrame。
-    event_year : float
-        事件年份。
-    windows : list, optional
-        时间窗口列表（年），默认 [100, 50, 25]。
-    n_boot : int, optional
-        Bootstrap 重采样次数。
+        分类群百分比数据，列为分类群名。
+    taxon_groups : dict
+        指标定义 {indicator_name: [taxon1, taxon2, ...]}。
+        用户根据研究区域和科学问题自行设计。
+    agg_func : str, optional
+        聚合方式：'sum' (默认, 求和) 或 'mean' (均值)。
 
     Returns
     -------
     Dict
-        {f'{w}yr': before_after_test result, ...} for each window
+        {'indicators': pd.DataFrame, 'indicator_names': list, 'n_groups': int}
     """
+    indicator_df = pd.DataFrame(index=data.index)
+
+    for name, taxa in taxon_groups.items():
+        present = [t for t in taxa if t in data.columns]
+        if not present:
+            indicator_df[name] = 0.0
+            continue
+        if agg_func == 'sum':
+            indicator_df[name] = data[present].sum(axis=1)
+        elif agg_func == 'mean':
+            indicator_df[name] = data[present].mean(axis=1)
+        else:
+            raise ValueError(f"agg_func 须为 'sum'/'mean'")
+
+    return {
+        'indicators': indicator_df,
+        'indicator_names': list(taxon_groups.keys()),
+        'n_groups': len(taxon_groups),
+        'agg_func': agg_func,
+    }
+
+
+def before_after_test(
+    time_series: np.ndarray,
+    ages: np.ndarray,
+    event_year: float,
+    window: int = 50,
+    n_boot: int = 10000,
+) -> Dict:
+    """事件前后差异检验。
+
+    在事件年份前后各取 window 年的数据，用 Bootstrap BCa 检验差异。
+
+    Parameters
+    ----------
+    time_series : np.ndarray
+        时间序列值 (n,)。
+    ages : np.ndarray
+        年龄数组 (n,)。
+    event_year : float
+        事件年份。
+    window : int, optional
+        前后窗口大小（年），默认 50。
+    n_boot : int, optional
+        Bootstrap 次数。
+
+    Returns
+    -------
+    Dict
+        {'before_mean': float, 'after_mean': float, 'difference': float,
+         'ci': tuple, 'p_value': float, 'window': int}
+    """
+    ages = np.asarray(ages)
+    values = np.asarray(time_series, dtype=float)
+
+    before_mask = (ages >= event_year - window) & (ages < event_year)
+    after_mask = (ages >= event_year) & (ages <= event_year + window)
+
+    before = values[before_mask]
+    after = values[after_mask]
+
+    if len(before) == 0 or len(after) == 0:
+        return {'error': f'窗口 {window} 年内数据不足（before={len(before)}, after={len(after)}）'}
+
+    diff = np.mean(after) - np.mean(before)
+
+    from scipy.stats import bootstrap, mannwhitneyu
+
+    try:
+        result = bootstrap(
+            (after, before),
+            statistic=lambda a, b: np.mean(a) - np.mean(b),
+            n_resamples=n_boot, method='BCa',
+            confidence_level=0.95,
+        )
+        ci = (result.confidence_interval.low, result.confidence_interval.high)
+    except Exception:
+        ci = (np.nan, np.nan)
+
+    try:
+        _, p_val = mannwhitneyu(before, after, alternative='two-sided')
+    except Exception:
+        p_val = np.nan
+
+    return {
+        'before_mean': float(np.mean(before)),
+        'after_mean': float(np.mean(after)),
+        'difference': float(diff),
+        'ci': ci,
+        'p_value': float(p_val),
+        'window': window,
+        'n_before': len(before),
+        'n_after': len(after),
+    }
+
+
+def multi_window_robustness(
+    time_series: np.ndarray,
+    ages: np.ndarray,
+    event_year: float,
+    windows: List[int] = None,
+    n_boot: int = 10000,
+) -> Dict:
+    """多时间窗口稳健性检验。
+
+    用不同窗口大小（如 100/50/25 年）重复 before_after_test，
+    评估结论是否对窗口选择敏感。
+
+    Parameters
+    ----------
+    time_series : np.ndarray
+        时间序列值 (n,)。
+    ages : np.ndarray
+        年龄数组 (n,)。
+    event_year : float
+        事件年份。
+    windows : list, optional
+        窗口列表，默认 [100, 50, 25]。
+    n_boot : int, optional
+        Bootstrap 次数。
+
+    Returns
+    -------
+    Dict
+        {'results': dict (window -> test_result), 'robust': bool, 'windows': list}
+    """
+    if windows is None:
+        windows = [100, 50, 25]
+
     results = {}
     for w in windows:
-        before = data[
-            (data.year >= event_year - w) & (data.year < event_year)
-        ].drop(columns=['year'])
-        after = data[
-            (data.year > event_year) & (data.year <= event_year + w)
-        ].drop(columns=['year'])
+        results[w] = before_after_test(time_series, ages, event_year, window=w, n_boot=n_boot)
 
-        if len(before) > 0 and len(after) > 0:
-            # 对所有指标列合并检验
-            before_vals = before.values.ravel()
-            after_vals = after.values.ravel()
-            # 移除 NaN
-            before_vals = before_vals[~np.isnan(before_vals)]
-            after_vals = after_vals[~np.isnan(after_vals)]
+    # 稳健性判断：所有窗口的差异方向一致且 p<0.05
+    diffs = [r.get('difference', np.nan) for r in results.values() if 'difference' in r]
+    p_vals = [r.get('p_value', np.nan) for r in results.values() if 'p_value' in r]
 
-            if len(before_vals) >= 20 and len(after_vals) >= 20:
-                results[f'{w}yr'] = before_after_test(
-                    before_vals, after_vals, n_boot
-                )
-            else:
-                results[f'{w}yr'] = {
-                    'diff': np.mean(after_vals) - np.mean(before_vals),
-                    'note': f'样本量不足 (n_before={len(before_vals)}, '
-                            f'n_after={len(after_vals)})，BCa 不稳定',
-                    'significant': None,
-                }
-        else:
-            results[f'{w}yr'] = {
-                'diff': None,
-                'note': '该窗口内无数据',
-                'significant': None,
-            }
+    if len(diffs) >= 2 and len(p_vals) >= 2:
+        same_sign = all(d > 0 for d in diffs) or all(d < 0 for d in diffs)
+        all_significant = all(p < 0.05 for p in p_vals if not np.isnan(p))
+        robust = same_sign and all_significant
+    else:
+        robust = None
 
-    return results
+    return {
+        'results': results,
+        'robust': robust,
+        'windows': windows,
+        'n_windows': len(windows),
+    }

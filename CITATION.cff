@@ -1,28 +1,29 @@
 cff-version: 1.2.0
-title: "Paleoecology Meta-Analysis Skill: 滇桂黔喀斯特区花粉-植被-气候研究综合分析工具包"
+title: "Paleoecology Meta-Analysis Skill: 古生态学与古气候学多代理指标 meta 分析工具包"
 message: "如果您在研究中使用此工具包，请按以下方式引用。"
 type: software
 authors:
   - given-names: "paleoecology-research"
-title-alternative: "面向古生态学时序数据的混合方法 Meta 分析工具（BAM 年龄集合 + SCC/DCC/CPS/PAI/GAM 合成 + Bootstrap BCa + 效应量）"
-version: "1.0.0"
+title-alternative: "面向古生态学时序数据的混合方法 Meta 分析工具（BAM 年龄集合 + SCC/DCC/CPS/PAI/GAM 合成 + Bootstrap BCa + 效应量 + 连续值代理校准）"
+version: "2.0.0"
 date-released: "2026-07-17"
 license: MIT
 repository-code: "https://github.com/1itti1/paleoecology-meta-analysis-skill"
 keywords:
   - paleoecology
+  - paleoclimate
   - meta-analysis
-  - pollen
-  - karst
-  - Yunnan-Guangxi-Guizhou
+  - multi-proxy
   - BAM
   - bootstrap
   - effect-size
+  - continuous-proxy
+  - dual-channel
 preferred-citation:
   type: software
   title: "Paleoecology Meta-Analysis Skill"
   authors:
     - given-names: "paleoecology-research"
-  version: "1.0.0"
+  version: "2.0.0"
   date-released: "2026-07-17"
   license: MIT

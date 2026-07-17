@@ -1,6 +1,10 @@
 """
-古生态学数据预处理模块。
-涵盖 BAM 年龄模型、z-score 标准化、时空对齐、花粉命名统一、喀斯特保存偏倚记录。
+古生态学与古气候学数据预处理模块（多代理、多区域通用）。
+涵盖 BAM 年龄模型、z-score 标准化、时空对齐、分类群命名统一、保存偏倚记录。
+
+支持两类代理数据：
+- 分类群百分比型（花粉、孢粉、硅藻、有孔虫等）：harmonize_names / record_preservation_bias
+- 连续值型（δDwax、brGDGTs、粒度、有机碳等）：见 continuous_proxy.py
 
 文献来源：
 - Comboul 2014 [9]: BAM 年龄模型
@@ -9,10 +13,43 @@
 - Power 2008 [4]: z-score 标准化
 """
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# 保存偏倚预设库：proxy_type × environment → (sensitive_taxa, tolerant_taxa, note)
+# 用户可直接调用预设，也可通过 custom 自定义。
+# ---------------------------------------------------------------------------
+PRESERVATION_BIAS_PRESETS: Dict[str, Dict] = {
+    'pollen-karst': {
+        'sensitive': ['Ericaceae', 'Vaccinium', 'Rhododendron'],
+        'tolerant': ['Poaceae', 'Cyperaceae', 'Pinus'],
+        'note': '喀斯特碱性土壤保存偏倚：喜酸分类群低估，耐碱分类群相对高估。',
+    },
+    'pollen-arid': {
+        'sensitive': ['Pteridophyta', 'Lycopodium', 'Selaginella'],
+        'tolerant': ['Chenopodiaceae', 'Artemisia', 'Ephedra'],
+        'note': '干旱区保存偏倚：薄壁孢子降解，旱生耐受分类群相对富集。',
+    },
+    'pollen-tropical': {
+        'sensitive': ['Moraceae', 'Urticaceae', 'Melastomataceae'],
+        'tolerant': ['Poaceae', 'Cyathea', 'Pteridophyta'],
+        'note': '热带氧化环境保存偏倚：薄壁分类群优先降解。',
+    },
+    'diatom-lake': {
+        'sensitive': ['Fragilaria', 'Eunotia'],
+        'tolerant': ['Aulacoseira', 'Stephanodiscus'],
+        'note': '湖泊硅藻溶解偏倚：薄壳属种优先溶解，厚壳属种相对富集。',
+    },
+    'foraminifera-marine': {
+        'sensitive': ['Globigerinoides', 'Globigerina'],
+        'tolerant': ['Globorotalia', 'Neogloboquadrina'],
+        'note': '海洋有孔虫溶解偏倚：薄壳表层种易溶解，厚壳深水种相对保存。',
+    },
+}
 
 
 def bam_age_ensemble(
@@ -25,6 +62,7 @@ def bam_age_ensemble(
 
     从年龄-深度数据生成年龄集合，每个成员保持地层单调性。
     BAM 的 RMSE 为 251 年，与 Bacon (198 年) 可比 (Kaufman 2020)。
+    适用于任意区域、任意沉积物类型（湖泊、海洋、泥炭、石笋等）。
 
     Parameters
     ----------
@@ -65,7 +103,7 @@ def consume_bacon_ages(bacon_output_path: str) -> Dict:
     """Kaufman 2020：消费已有 Bacon 年表输出。
 
     加载 Bacon 年龄集合输出，每个成员为单调年龄-深度曲线。
-    用户已有的 BS/JL/JY 等 7 个洼地 Bacon 模型可直接消费。
+    适用于任何已用 Bacon/Clam 建模的沉积岩芯。
 
     Parameters
     ----------
@@ -106,8 +144,10 @@ def zscore_standardize(
 ) -> Dict:
     """Izdebski 2022, Power 2008：z-score 标准化。
 
-    对每个岩芯的每个分类群，以研究时段均值和标准差计算 z-score：
+    对每个岩芯的每个变量（分类群百分比或连续值代理），以研究时段均值和标准差计算 z-score：
     z = (x - μ) / σ
+
+    适用于任意代理类型（花粉、硅藻、有孔虫、δDwax、brGDGTs 等）。
 
     Parameters
     ----------
@@ -116,7 +156,7 @@ def zscore_standardize(
     baseline_period : tuple, optional
         基准时段 (start, end)。默认整个研究时段 (Izdebski 2022)。
     group_col : str, optional
-        DataFrame 中的分组列名（如分类群名或岩芯 ID）。
+        DataFrame 中的分组列名（如分类群名、岩芯 ID 或代理类型）。
 
     Returns
     -------
@@ -162,13 +202,14 @@ def resample_to_grid(
 
     将不同分辨率岩芯重采样到统一时间网格。
     若提供 age_ensembles，对每个成员独立插值以传播年龄不确定性。
+    适用于任意代理类型。
 
     Parameters
     ----------
     ages : np.ndarray
         年龄数组 (n_depths,)。
     values : np.ndarray
-        代理值数组 (n_depths,) 或 (n_depths, n_taxa)。
+        代理值数组 (n_depths,) 或 (n_depths, n_vars)。
     time_grid : np.ndarray
         统一时间网格 (n_bins,)。
     age_ensembles : np.ndarray, optional
@@ -177,7 +218,7 @@ def resample_to_grid(
     Returns
     -------
     Dict
-        {'resampled': np.ndarray (n_bins,) or (n_members, n_bins, n_taxa),
+        {'resampled': np.ndarray (n_bins,) or (n_members, n_bins, n_vars),
          'time_grid': np.ndarray, 'n_bins': int}
     """
     if values.ndim == 1:
@@ -185,50 +226,58 @@ def resample_to_grid(
 
     if age_ensembles is not None:
         n_members = age_ensembles.shape[0]
-        n_taxa = values.shape[1]
-        resampled = np.zeros((n_members, len(time_grid), n_taxa))
+        n_vars = values.shape[1]
+        resampled = np.zeros((n_members, len(time_grid), n_vars))
         for m in range(n_members):
-            for t in range(n_taxa):
+            for t in range(n_vars):
                 resampled[m, :, t] = np.interp(
                     time_grid, age_ensembles[m], values[:, t]
                 )
-        if n_taxa == 1:
+        if n_vars == 1:
             resampled = resampled[:, :, 0]
         return {'resampled': resampled, 'time_grid': time_grid, 'n_bins': len(time_grid)}
 
-    n_taxa = values.shape[1]
-    resampled = np.zeros((len(time_grid), n_taxa))
-    for t in range(n_taxa):
+    n_vars = values.shape[1]
+    resampled = np.zeros((len(time_grid), n_vars))
+    for t in range(n_vars):
         resampled[:, t] = np.interp(time_grid, ages, values[:, t])
-    if n_taxa == 1:
+    if n_vars == 1:
         resampled = resampled[:, 0]
     return {'resampled': resampled, 'time_grid': time_grid, 'n_bins': len(time_grid)}
 
 
 def spatial_clustering(
     site_coords: pd.DataFrame,
-    method: str = 'karst',
+    method: str = 'auto',
     radius_km: float = 200,
+    grid_resolution: float = 2.0,
 ) -> Dict:
-    """Izdebski 2022：地理区域聚类。
+    """Izdebski 2022, Kaufman 2020：空间聚类或网格化。
 
-    按地理坐标聚类，替代经纬度网格化。
-    喀斯特区推荐地理聚类——洼地/谷地/坡地空间异质性使聚类比网格更有生态意义。
+    将多点研究站点按地理关系分组，用于区域合成前的空间对齐。
+    方法选择以站点空间分布特征为判据，不预设特定地理环境。
 
     Parameters
     ----------
     site_coords : pd.DataFrame
         含 'lat', 'lon' 列的点位坐标，索引为点位名。
     method : str, optional
-        聚类方法：'karst' (地理聚类, 默认) 或 'grid' (等面积网格化)。
+        聚类方法：
+        - 'auto' (默认)：根据站点密度自动选择。站点密集且分布不均时用 'cluster'，
+          站点稀疏或均匀分布时用 'grid'。
+        - 'cluster'：基于距离的地理聚类（Izdebski 2022）。
+        - 'grid'：等面积经纬度网格化（Kaufman 2020）。
+        - 'karst'：'cluster' 的别名，保留向后兼容。
     radius_km : float, optional
         聚类半径 (km)，默认 200 (Izdebski 2022)。
+    grid_resolution : float, optional
+        网格分辨率 (度)，默认 2.0。
 
     Returns
     -------
     Dict
         {'clusters': dict (cluster_id -> [site_names]),
-         'method': str, 'radius_km': float}
+         'method': str, 'radius_km': float or None, 'grid_resolution': float or None}
     """
     from math import radians, sin, cos, asin, sqrt
 
@@ -239,8 +288,41 @@ def spatial_clustering(
         a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
         return 6371 * 2 * asin(sqrt(a))
 
+    # 'karst' 向后兼容
+    if method == 'karst':
+        method = 'cluster'
+
+    # auto 模式：根据站点密度选择
+    if method == 'auto':
+        n_sites = len(site_coords)
+        lat_range = site_coords['lat'].max() - site_coords['lat'].min()
+        lon_range = site_coords['lon'].max() - site_coords['lon'].min()
+        area = max(lat_range * lon_range, 1.0)
+        density = n_sites / area
+        # 站点密集（>0.5 个/平方度）且数量≥6 时用聚类，否则用网格
+        method = 'cluster' if (density > 0.5 and n_sites >= 6) else 'grid'
+
     sites = list(site_coords.index)
     n = len(sites)
+
+    if method == 'grid':
+        # 等面积网格化
+        clusters = {}
+        for site in sites:
+            lat = site_coords.loc[site, 'lat']
+            lon = site_coords.loc[site, 'lon']
+            grid_lat = round(lat / grid_resolution) * grid_resolution
+            grid_lon = round(lon / grid_resolution) * grid_resolution
+            key = f'{grid_lat}_{grid_lon}'
+            clusters.setdefault(key, []).append(site)
+        # 将 key 转为序号
+        clusters = {i + 1: v for i, v in enumerate(clusters.values())}
+        return {
+            'clusters': clusters, 'method': 'grid',
+            'radius_km': None, 'grid_resolution': grid_resolution,
+        }
+
+    # cluster 模式：基于距离的地理聚类
     assigned = [False] * n
     clusters = {}
     cluster_id = 0
@@ -263,21 +345,25 @@ def spatial_clustering(
                 clusters[cluster_id].append(sites[j])
                 assigned[j] = True
 
-    return {'clusters': clusters, 'method': method, 'radius_km': radius_km}
+    return {
+        'clusters': clusters, 'method': 'cluster',
+        'radius_km': radius_km, 'grid_resolution': None,
+    }
 
 
-def harmonize_taxon_names(
-    pollen_df: pd.DataFrame,
+def harmonize_names(
+    data_df: pd.DataFrame,
     mapping_dict: Dict[str, str],
 ) -> Dict:
-    """花粉分类群命名统一。
+    """分类群命名统一（通用）。
 
-    不同实验室可能使用不同分类群命名体系，须建立映射表统一到一致分类框架。
+    不同实验室/数据库可能使用不同分类群命名体系，须建立映射表统一到一致分类框架。
+    适用于花粉、孢粉、硅藻、有孔虫、大植物化石等任意分类群百分比数据。
 
     Parameters
     ----------
-    pollen_df : pd.DataFrame
-        花粉百分比数据，列为分类群名。
+    data_df : pd.DataFrame
+        分类群百分比数据，列为分类群名。
     mapping_dict : dict
         命名映射字典 {旧名: 新名}。
 
@@ -286,7 +372,7 @@ def harmonize_taxon_names(
     Dict
         {'harmonized_df': pd.DataFrame, 'n_renamed': int, 'unmapped': list}
     """
-    harmonized = pollen_df.rename(columns=mapping_dict)
+    harmonized = data_df.rename(columns=mapping_dict)
     # 合并同名列
     if harmonized.columns.duplicated().any():
         dup_cols = harmonized.columns[harmonized.columns.duplicated()].unique()
@@ -295,8 +381,8 @@ def harmonize_taxon_names(
             harmonized[col] = harmonized.loc[:, mask].sum(axis=1)
         harmonized = harmonized.loc[:, ~harmonized.columns.duplicated()]
 
-    n_renamed = sum(1 for k, v in mapping_dict.items() if k in pollen_df.columns)
-    unmapped = [c for c in pollen_df.columns if c not in mapping_dict]
+    n_renamed = sum(1 for k, v in mapping_dict.items() if k in data_df.columns)
+    unmapped = [c for c in data_df.columns if c not in mapping_dict]
 
     return {
         'harmonized_df': harmonized,
@@ -306,38 +392,75 @@ def harmonize_taxon_names(
 
 
 def record_preservation_bias(
-    pollen_df: pd.DataFrame,
-    sensitive_taxa: list,
-    tolerant_taxa: list,
+    data_df: pd.DataFrame,
+    proxy_type: str = 'pollen',
+    environment: str = 'general',
+    sensitive_taxa: Optional[List[str]] = None,
+    tolerant_taxa: Optional[List[str]] = None,
+    preset: Optional[str] = None,
 ) -> Dict:
-    """喀斯特区花粉保存偏倚记录。
+    """分类群保存偏倚记录（多环境预设插件）。
 
-    碱性土壤环境导致花粉保存存在系统性偏倚：
-    喜酸分类群（如杜鹃花科 Ericaceae）可能被低估，
-    耐碱分类群（如禾本科 Poaceae）可能被相对高估。
-    须在预处理中显式记录，并在结果解读时纳入考虑。
+    沉积环境导致分类群保存存在系统性偏倚。须在预处理中显式记录，
+    并在结果解读时纳入考虑。
+
+    使用方式：
+    1. 调用预设：preset='pollen-karst'（自动填充 sensitive/tolerant）
+    2. 自定义：传入 sensitive_taxa 和 tolerant_taxa 列表
+    3. 混合：preset + 覆盖部分参数
+
+    内置预设见 PRESERVATION_BIAS_PRESETS：
+    - pollen-karst: 喀斯特碱性土壤（喜酸低估）
+    - pollen-arid: 干旱区（薄壁孢子降解）
+    - pollen-tropical: 热带氧化环境（薄壁分类群降解）
+    - diatom-lake: 湖泊硅藻（薄壳属种溶解）
+    - foraminifera-marine: 海洋有孔虫（薄壳种溶解）
 
     Parameters
     ----------
-    pollen_df : pd.DataFrame
-        花粉百分比数据。
-    sensitive_taxa : list
-        保存敏感分类群列表（如 ['Ericaceae', 'Vaccinium']）。
-    tolerant_taxa : list
-        保存耐受分类群列表（如 ['Poaceae', 'Cyperaceae']）。
+    data_df : pd.DataFrame
+        分类群百分比数据。
+    proxy_type : str, optional
+        代理类型（'pollen'/'diatom'/'foraminifera' 等），用于查找预设。
+    environment : str, optional
+        环境类型（'karst'/'arid'/'tropical'/'lake'/'marine'/'general'）。
+    sensitive_taxa : list, optional
+        保存敏感分类群列表。提供时覆盖预设。
+    tolerant_taxa : list, optional
+        保存耐受分类群列表。提供时覆盖预设。
+    preset : str, optional
+        直接指定预设键名（如 'pollen-karst'），优先于 proxy_type×environment。
 
     Returns
     -------
     Dict
         {'sensitive_ratio': pd.Series, 'tolerant_ratio': pd.Series,
-         'bias_index': pd.Series, 'note': str}
+         'bias_index': pd.Series, 'preset': str, 'note': str}
     """
-    sensitive_present = [t for t in sensitive_taxa if t in pollen_df.columns]
-    tolerant_present = [t for t in tolerant_taxa if t in pollen_df.columns]
+    # 解析预设
+    preset_key = preset if preset is not None else f'{proxy_type}-{environment}'
+    preset_data = PRESERVATION_BIAS_PRESETS.get(preset_key, {})
 
-    sensitive_sum = pollen_df[sensitive_present].sum(axis=1) if sensitive_present else 0
-    tolerant_sum = pollen_df[tolerant_present].sum(axis=1) if tolerant_present else 0
-    total = pollen_df.sum(axis=1)
+    sensitive = sensitive_taxa if sensitive_taxa is not None else preset_data.get('sensitive', [])
+    tolerant = tolerant_taxa if tolerant_taxa is not None else preset_data.get('tolerant', [])
+    note = preset_data.get('note', f'自定义保存偏倚（proxy={proxy_type}, env={environment}）。')
+
+    if not sensitive or not tolerant:
+        return {
+            'sensitive_ratio': pd.Series(np.nan, index=data_df.index),
+            'tolerant_ratio': pd.Series(np.nan, index=data_df.index),
+            'bias_index': pd.Series(np.nan, index=data_df.index),
+            'preset': preset_key,
+            'note': f'未找到预设 {preset_key} 且未提供 sensitive/tolerant 列表。'
+                    f'可用预设: {list(PRESERVATION_BIAS_PRESETS.keys())}',
+        }
+
+    sensitive_present = [t for t in sensitive if t in data_df.columns]
+    tolerant_present = [t for t in tolerant if t in data_df.columns]
+
+    sensitive_sum = data_df[sensitive_present].sum(axis=1) if sensitive_present else 0
+    tolerant_sum = data_df[tolerant_present].sum(axis=1) if tolerant_present else 0
+    total = data_df.sum(axis=1)
 
     sensitive_ratio = sensitive_sum / total.replace(0, np.nan)
     tolerant_ratio = tolerant_sum / total.replace(0, np.nan)
@@ -348,6 +471,10 @@ def record_preservation_bias(
         'sensitive_ratio': sensitive_ratio,
         'tolerant_ratio': tolerant_ratio,
         'bias_index': bias_index,
-        'note': '喀斯特碱性土壤保存偏倚：喜酸分类群低估，耐碱分类群相对高估。'
-                '须在结果解读时纳入考虑，可作为敏感性检验之一。',
+        'preset': preset_key,
+        'note': note + '须在结果解读时纳入考虑，可作为敏感性检验之一。',
     }
+
+
+# 向后兼容别名
+harmonize_taxon_names = harmonize_names
