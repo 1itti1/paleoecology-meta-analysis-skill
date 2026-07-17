@@ -1,0 +1,23 @@
+# 核心依赖（5 个脚本均需）
+numpy>=1.21
+pandas>=1.3
+scipy>=1.7
+statsmodels>=0.14
+
+# 合成模块可选依赖（gam_composite 需要）
+pygam>=0.8
+
+# 空间独立性检验可选依赖（check_spatial_independence 需要）
+libpysal>=4.6
+esda>=2.4
+
+# 贝叶斯扩展（可选，贝叶斯 GAM 报告）
+# pymc>=5.0
+# arviz>=1.0
+
+# 地理可视化（可选）
+# cartopy>=0.21
+
+# 古气候数据接口（可选）
+# pylipd>=0.2
+# pyleoclim>=0.13
