@@ -62,7 +62,7 @@ paleoecology-meta-analysis-skill/
 ## 安装
 
 ```bash
-git clone https://github.com/paleoecology-research/paleoecology-meta-analysis-skill.git
+git clone https://github.com/1itti1/paleoecology-meta-analysis-skill.git
 cd paleoecology-meta-analysis-skill
 
 # 核心依赖
@@ -181,7 +181,7 @@ R 环境被 Smart App Control 阻断，因此：
   version = {1.0.0},
   date = {2026-07-17},
   license = {MIT},
-  url = {https://github.com/paleoecology-research/paleoecology-meta-analysis-skill}
+  url = {https://github.com/1itti1/paleoecology-meta-analysis-skill}
 }
 ```
 
