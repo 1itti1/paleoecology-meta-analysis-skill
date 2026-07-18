@@ -1,14 +1,48 @@
 # Paleoecology Meta-Analysis Skill
 
-**Synthesize multi-site, multi-proxy paleoecological data with peer-review-grade statistical rigor.**
+**[English](README.md)** | [简体中文](README_zh-CN.md)
 
-A hybrid meta-analysis toolkit for paleoecology and paleoclimate research: paleoecology-native synthesis (z-score, Bootstrap BCa, GAM, Monte Carlo ensembles) as the main route, with classical effect sizes (log response ratio, Hedges' d) as a conditional module triggered by data structure — not discipline preference.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![Version](https://img.shields.io/badge/Version-2.0.0-green.svg)](https://github.com/1itti1/paleoecology-meta-analysis-skill)
+[![DOI](https://img.shields.io/badge/DOI-cite-orange.svg)](#citation)
+
+> Synthesize multi-site, multi-proxy paleoecological data with peer-review-grade statistical rigor.
+
+A hybrid meta-analysis toolkit for paleoecology and paleoclimate research. It combines paleoecology-native synthesis (z-score, Bootstrap BCa, GAM, Monte Carlo ensembles) as the main route with classical effect sizes (log response ratio, Hedges' d) as a conditional module — triggered by data structure, not discipline preference.
 
 **Compass points:** 🧭 dual-channel · 📊 synthesize · 📏 calibrate · 🛡️ validate · 📝 cite
 
+---
+
+## Table of Contents
+
+- [What It Does](#-what-it-does)
+- [Key Features](#-key-features)
+- [Quick Start](#-quick-start)
+- [Mental Model](#-mental-model)
+- [Workflow Pipeline](#-workflow-pipeline)
+- [Supported Data Types](#-supported-data-types)
+- [Scenario Selection](#-scenario-selection)
+- [Dual-Channel Architecture](#-dual-channel-architecture)
+- [Module Reference](#-module-reference)
+- [Statistical Rigor](#-statistical-rigor)
+- [Preservation Bias Presets](#-preservation-bias-presets)
+- [Code Examples](#-code-examples)
+- [Practical Notes](#-practical-notes)
+- [Literature Foundation](#-literature-foundation)
+- [Repository Layout](#-repository-layout)
+- [FAQ](#-faq)
+- [Roadmap](#-roadmap)
+- [Contributing](#-contributing)
+- [License](#-license)
+- [Citation](#-citation)
+
+---
+
 ## 🎯 What It Does
 
-This skill is designed for the questions researchers face after collecting multi-site core data:
+This toolkit is designed for the questions researchers face after collecting multi-site core data:
 
 - How do I combine 3+ sediment cores with different time resolutions into one regional curve?
 - Is my δDwax-reconstructed precipitation trustworthy? How large is the systematic bias?
@@ -24,6 +58,19 @@ It is especially useful when working with:
 - Before/after event comparison designs
 - Karst, arid, tropical, lake, or marine environments
 
+## ✨ Key Features
+
+| Feature | Description |
+|---|---|
+| **Dual-channel architecture** | Separate pipelines for taxon-percentage data (pollen, diatoms) and continuous-value proxies (δDwax, brGDGTs), sharing a common statistical validation framework |
+| **46 functions across 6 modules** | Preprocessing, continuous proxy, synthesis, effect size, scenarios, validation — each function with literature-anchored docstrings |
+| **Three scenario workflows** | Proxy validation, multi-site synthesis, event attribution — each with a complete method chain from raw data to peer-review-ready output |
+| **Three-layer uncertainty propagation** | Age uncertainty (BAM/Bacon ensembles) + calibration uncertainty (RMSEP) + sampling uncertainty (Bootstrap), propagated jointly through 500-member Monte Carlo ensembles |
+| **Five environment presets** | Preservation bias plugins for karst, arid, tropical, lake, and marine environments — auto-selected or manually overridden |
+| **Literature-anchored parameters** | Every default value matches the published source: `n_members=500` (Kaufman 2020), `n_boot=10000` (Izdebski 2022), `n_splines=20` (GAM), `frac=0.2` (LOESS) |
+| **Python-only** | No R dependency. BAM (pure Python) replaces Bacon/Clam age models with comparable accuracy (RMSE 251 yr vs 198 yr) |
+| **TRAE Skill compatible** | Drop into `.trae/skills/` for automatic loading in TRAE IDE sessions |
+
 ## 🚀 Quick Start
 
 ### 1. Install
@@ -34,7 +81,7 @@ cd paleoecology-meta-analysis-skill
 pip install -r requirements.txt
 ```
 
-Or use as a TRAE Skill — copy the skill folder into your TRAE skills directory:
+Or use as a TRAE Skill:
 
 ```bash
 # Linux / macOS
@@ -46,15 +93,15 @@ New-Item -ItemType Directory -Force $HOME\.trae\skills | Out-Null
 Copy-Item -Recurse -Force .\paleoecology-meta-analysis $HOME\.trae\skills\
 ```
 
-### 2. Run A Smoke Test
+### 2. Smoke Test
 
-Verify the modules import correctly and the core pipeline works:
+Verify the modules import and the core pipeline works:
 
 ```python
 import sys; sys.path.insert(0, 'scripts')
 
 from preprocessing import bam_age_ensemble, zscore_standardize
-from continuous_proxy import standardize_continuous_proxy, composite_continuous_proxy
+from continuous_proxy import standardize_continuous_proxy
 import numpy as np
 
 # Generate a small test age ensemble
@@ -70,55 +117,9 @@ std = standardize_continuous_proxy(values, method='zscore')
 print(f"Z-scores: {std['standardized']}")
 ```
 
-If you see the ensemble shape and z-scores without errors, the toolkit is ready.
+### 3. Run a Full Analysis
 
-### 3. Run A Full Analysis
-
-**Scenario 1 — Validate a proxy against observations:**
-
-```python
-from effect_size import log_response_ratio, effect_size_bca, rmsep
-from continuous_proxy import calibrate_continuous_proxy, cross_validate_calibration
-
-# Calibrate proxy → climate variable
-calib = calibrate_continuous_proxy(proxy_values, calib_x, calib_y)
-
-# Quantify systematic bias
-ratios = log_response_ratio(proxy_values, observed_values)
-ci = effect_size_bca(proxy_values, observed_values, n_boot=10000)
-precision = rmsep(proxy_values, observed_values)
-```
-
-**Scenario 2 — Synthesize multi-site time series:**
-
-```python
-from preprocessing import bam_age_ensemble
-from continuous_proxy import composite_continuous_proxy
-
-# Propagate age uncertainty through synthesis
-result = composite_continuous_proxy(
-    site_values, site_ages, time_grid,
-    age_ensembles=age_ens, proxy_errors=errors,
-    n_members=500
-)
-# result['uncertainty_band'] has 5%/50%/95% percentiles
-```
-
-**Scenario 3 — Attribute change to an event:**
-
-```python
-from scenarios import scenario3_human_attribution, build_indicators, multi_window_robustness
-
-# Define your own indicator system (any region, any taxa)
-indicators = build_indicators(data_df, {
-    'crop': ['Oryza', 'Triticum'],
-    'forest': ['Quercus', 'Pinus'],
-    'disturbance': ['Artemisia', 'Chenopodiaceae'],
-})
-
-result = scenario3_human_attribution(before_data, after_data, event_year=-1)
-robustness = multi_window_robustness(time_series, ages, event_year=-1, windows=[100, 50, 25])
-```
+See [Code Examples](#-code-examples) for complete walkthroughs of all three scenarios.
 
 ## 🧠 Mental Model
 
@@ -144,9 +145,9 @@ mindmap
       Dual-proxy comparison
     🛡️ Validate
       Normality / independence checks
-      Three-layer uncertainty (age + calibration + sampling)
+      Three-layer uncertainty
       Six validation strategies
-      Peer-review defensibility checklist
+      Peer-review defensibility
     📝 Cite
       Literature-anchored parameters
       Docstring source attribution
@@ -167,7 +168,7 @@ flowchart LR
   G --> H[Uncertainty band 5/50/95%]
   H --> I{Validation}
   I -->|Pass| J[Peer-review-ready output]
-  I -->|Fail| K[Check assumptions / try block bootstrap]
+  I -->|Fail| K[Check assumptions / block bootstrap]
   K --> F
 ```
 
@@ -182,7 +183,7 @@ flowchart LR
 | Bacon/Clam age output | Shared | `consume_bacon_ages()` imports existing age models |
 | Multi-site coordinates | Shared | `spatial_clustering()` auto-selects grid or distance clustering |
 
-## 🧩 Scenario Selection Logic
+## 🧩 Scenario Selection
 
 The toolkit selects methods based on **data structure**, not discipline preference:
 
@@ -203,24 +204,63 @@ The toolkit selects methods based on **data structure**, not discipline preferen
 
 Both channels share `effect_size.py`, `validation.py`, and `scenarios.py` — statistical rigor is consistent regardless of proxy type.
 
+## 📦 Module Reference
+
+| Module | Functions | Key functions | Literature basis |
+|---|---|---|---|
+| `preprocessing.py` | 7 | `bam_age_ensemble`, `zscore_standardize`, `resample_to_grid`, `spatial_clustering` (auto), `harmonize_names`, `record_preservation_bias` (presets) | Comboul 2014, Kaufman 2020, Izdebski 2022 |
+| `continuous_proxy.py` | 6 | `standardize_continuous_proxy`, `calibrate_continuous_proxy`, `composite_continuous_proxy`, `propagate_continuous_uncertainty`, `cross_validate_calibration`, `proxy_comparison` | Kaufman 2020, Roberts 2018 |
+| `synthesis.py` | 10 | `scc_composite`, `dcc_composite`, `cps_composite`, `pai_composite`, `gam_composite`, `monte_carlo_ensemble`, `loess_trend` | Kaufman 2020, Marlon 2008 |
+| `effect_size.py` | 7 | `log_response_ratio`, `hedges_d`, `effect_size_bca`, `rmsep`, `loocv` | Hedges 1999, Izdebski 2022 |
+| `scenarios.py` | 7 | `scenario1_proxy_validation`, `scenario2_multi_site_synthesis`, `scenario3_human_attribution`, `build_indicators` | All 7 sources |
+| `validation.py` | 9 | `check_normality_bootstrap`, `check_temporal_independence`, `check_spatial_independence`, `propagate_three_layer_uncertainty` | Izdebski 2022, Kaufman 2020 |
+
+**Module dependency chain:**
+
+```
+preprocessing ─┬─→ scenarios
+continuous_proxy┘
+synthesis ─────┘
+effect_size ───┘
+validation ────┘  (called by all scenarios)
+```
+
 ## 🛡️ Statistical Rigor
 
 ### Assumption Checks (run before any synthesis)
 
-- **Normality**: Shapiro-Wilk + Q-Q plot (Bootstrap is asymptotically robust for n>30)
-- **Temporal independence**: AR1 coefficient + Durbin-Watson (use block bootstrap if violated)
-- **Spatial independence**: Moran's I (cluster before synthesizing if violated)
-- **Sample size**: n>20 (BCa minimum), n>30 (asymptotic normality)
+| Assumption | Test | Action if violated |
+|---|---|---|
+| Normality | Shapiro-Wilk + Q-Q plot | Use Bootstrap (asymptotically robust for n>30) |
+| Temporal independence | AR1 coefficient + Durbin-Watson | Switch to block bootstrap |
+| Spatial independence | Moran's I | Cluster sites before synthesizing |
+| Sample size | n>20 (BCa), n>30 (asymptotic) | Report as preliminary / collect more data |
 
 ### Three-Layer Uncertainty Propagation
 
-- **Age layer**: Sample complete age-depth curves from BAM/Bacon posterior (preserve stratigraphic monotonicity)
-- **Calibration layer**: Proxy-climate calibration residuals as normal noise, σ from RMSEP
-- **Sampling layer**: Bootstrap resampling propagates naturally
+```
+Age layer          Calibration layer      Sampling layer
+    │                    │                      │
+    ▼                    ▼                      ▼
+BAM/Bacon          RMSEP as σ            Bootstrap
+posterior          for normal noise      resampling
+    │                    │                      │
+    └────────┬───────────┘                      │
+             ▼                                   │
+      500-member Monte Carlo ensemble ◄─────────┘
+             │
+             ▼
+      5%/50%/95% uncertainty band
+```
 
 ### Six Validation Strategies
 
-LOOCV / multi-method consistency (≥2 methods) / multi-window (100/50/25 yr) / dual-indicator system / external data comparison / sensitivity analysis
+1. **LOOCV** — Leave-one-out cross-validation of calibration models
+2. **Multi-method consistency** — Run ≥2 synthesis methods, compare results
+3. **Multi-window robustness** — Test with 100/50/25-year windows
+4. **Dual-indicator system** — Cross-validate with independent proxies
+5. **External data comparison** — Compare with instrumental/independent records
+6. **Sensitivity analysis** — Vary key parameters, assess result stability
 
 ## 🔌 Preservation Bias Presets
 
@@ -236,32 +276,115 @@ LOOCV / multi-method consistency (≥2 methods) / multi-window (100/50/25 yr) / 
 
 Override with `sensitive_taxa` and `tolerant_taxa` parameters for fully custom environments.
 
-## 📂 Repository Layout
+## 💻 Code Examples
 
+### Scenario 1: Proxy Validation
+
+Validate a δDwax-reconstructed precipitation against instrumental observations:
+
+```python
+import sys; sys.path.insert(0, 'scripts')
+import numpy as np
+
+from effect_size import log_response_ratio, effect_size_bca, rmsep
+from continuous_proxy import calibrate_continuous_proxy, cross_validate_calibration
+
+# --- Input data ---
+proxy_values = np.array([...])      # δDwax-reconstructed δDp
+observed_values = np.array([...])   # Instrumental δDp
+calib_x = np.array([...])           # Calibration set: δDwax
+calib_y = np.array([...])           # Calibration set: δDp
+
+# --- Step 1: Calibrate proxy → climate variable ---
+calib = calibrate_continuous_proxy(proxy_values, calib_x, calib_y, regression='ols')
+print(f"Calibration R²={calib['r2']:.3f}, RMSEP={calib['rmsep']:.2f}")
+
+# --- Step 2: Cross-validate the calibration model ---
+cv = cross_validate_calibration(calib_x, calib_y, method='loocv')
+print(f"LOOCV RMSEP={cv['rmsep']:.2f}, R²={cv['r2']:.3f}")
+
+# --- Step 3: Quantify systematic bias ---
+ratios = log_response_ratio(proxy_values, observed_values)
+ci = effect_size_bca(proxy_values, observed_values, n_boot=10000)
+precision = rmsep(proxy_values, observed_values)
+print(f"Mean log response ratio: {np.mean(ratios):.4f}")
+print(f"95% BCa CI: ({ci[0]:.4f}, {ci[1]:.4f})")
+print(f"RMSEP: {precision:.2f}")
 ```
-paleoecology-meta-analysis-skill/
-├── SKILL.md                    # TRAE Skill entry (frontmatter + 8 sections)
-├── README.md                   # This file
-├── LICENSE                     # MIT
-├── CITATION.cff                # Academic citation metadata
-├── requirements.txt            # Python dependencies
-├── .gitignore
-├── .gitattributes
-├── references/                 # 7 methodology reference docs
-│   ├── preprocessing.md        # Ch.3: BAM, z-score, spatial align, bias presets
-│   ├── synthesis_methods.md    # Ch.4: SCC/DCC/CPS/PAI/GAM, BCa, LOESS, ensembles
-│   ├── effect_size.md          # Ch.5: log response ratio, Hedges' d, boundaries
-│   ├── scenarios.md            # Ch.6: 3 scenarios, decision flowchart, dual-channel
-│   ├── validation.md           # Ch.7: assumption tests, 3-layer uncertainty, 6 strategies
-│   ├── python_toolchain.md     # Ch.8: 12 verified tools, version compatibility
-│   └── methodology_gaps.md     # Ch.9-10: 4 gaps, peer-review checklist
-└── scripts/                    # 6 Python modules, 46 functions
-    ├── preprocessing.py        # 7 functions: age ensembles, z-score, auto-clustering, bias presets
-    ├── continuous_proxy.py     # 6 functions: standardize, calibrate, composite, uncertainty, CV
-    ├── synthesis.py            # 10 functions: 5-method synthesis, Monte Carlo, LOESS
-    ├── effect_size.py          # 7 functions: log RR, Hedges' d, BCa, RMSEP, LOOCV
-    ├── scenarios.py            # 7 functions: 3-scenario orchestration, indicators, robustness
-    └── validation.py           # 9 functions: assumption checks, block bootstrap, 3-layer
+
+### Scenario 2: Multi-Site Synthesis
+
+Combine 3 lake cores into one regional vegetation trend:
+
+```python
+from preprocessing import bam_age_ensemble, zscore_standardize
+from continuous_proxy import standardize_continuous_proxy, composite_continuous_proxy
+import numpy as np
+
+# --- Input: 3 sites with different resolutions ---
+time_grid = np.arange(-2000, 0, 20)  # 2000 BP to present, 20-yr bins
+
+# Site A: high-resolution, has age ensembles
+site_a_ages = np.array([...])
+site_a_values = np.array([...])
+site_a_ens = bam_age_ensemble(site_a_depths, site_a_ages, site_a_errors, n_members=500)
+
+# Site B & C: similar structure...
+# (stack into arrays: site_values (n_sites, n_depths), site_ages (n_sites, n_depths))
+
+# --- Step 1: Standardize each site ---
+std_a = standardize_continuous_proxy(site_a_values, method='zscore')
+
+# --- Step 2: Composite with uncertainty propagation ---
+result = composite_continuous_proxy(
+    site_values,     # (3, n_depths)
+    site_ages,       # (3, n_depths)
+    time_grid,       # (n_bins,)
+    age_ensembles=site_a_ens['age_ensembles'],  # shared age model
+    proxy_errors=np.array([0.5, 0.7, 0.6]),     # per-site RMSEP
+    n_members=500,
+)
+
+# --- Step 3: Extract uncertainty band ---
+band = result['uncertainty_band']
+print(f"Median curve shape: {band['median'].shape}")
+print(f"90% CI at 1000 BP: [{band['lower'][50]:.2f}, {band['upper'][50]:.2f}]")
+```
+
+### Scenario 3: Event Attribution
+
+Test whether vegetation changed after a historical event (e.g., policy reform in 1726 AD):
+
+```python
+from scenarios import build_indicators, scenario3_human_attribution, multi_window_robustness
+
+# --- Step 1: Define your own indicator system ---
+# (fully user-customized — any region, any taxa)
+indicators = build_indicators(pollen_df, {
+    'crop': ['Oryza', 'Triticum', 'Hordeum'],
+    'pasture': ['Poaceae', 'Cyperaceae'],
+    'forest': ['Quercus', 'Pinus', 'Castanopsis'],
+    'disturbance': ['Artemisia', 'Chenopodiaceae'],
+}, agg_func='sum')
+
+# --- Step 2: Split before/after event ---
+event_year = 1726
+before_data = indicators.loc[indicators.index < event_year].values
+after_data = indicators.loc[indicators.index >= event_year].values
+
+# --- Step 3: Test difference ---
+result = scenario3_human_attribution(
+    before_data, after_data, event_year=event_year, n_boot=10000
+)
+for r in result['results']:
+    print(f"{r['indicator']}: diff={r['difference']:.3f}, "
+          f"CI=({r['ci'][0]:.3f}, {r['ci'][1]:.3f}), p={r['p_value']:.4f}")
+
+# --- Step 4: Multi-window robustness ---
+robustness = multi_window_robustness(
+    time_series, ages, event_year=event_year, windows=[100, 50, 25]
+)
+print(f"Robust across windows: {robustness['robust']}")
 ```
 
 ## 🛠️ Practical Notes
@@ -271,6 +394,7 @@ paleoecology-meta-analysis-skill/
 - **Optional dependencies**: `pygam` (GAM synthesis), `scikit-learn` (k-fold CV), `libpysal`+`esda` (Moran's I) are listed in requirements.txt but not strictly required. The toolkit gracefully degrades when they're absent.
 - **Parameter defaults** match published literature: `n_members=500` (Kaufman 2020), `n_boot=10000` (Izdebski 2022), `n_splines=20` (GAM), `frac=0.2` (LOESS, Cleveland & Devlin 1988).
 - **Start small**: Run the smoke test first. Verify the modules import. Then move to a single-core analysis before attempting multi-site synthesis.
+- **Cross-module imports**: `scenarios.py` uses `sys.path.insert` to import other modules. If using modules independently, add the `scripts/` directory to your Python path.
 
 ## 📚 Literature Foundation
 
@@ -288,6 +412,100 @@ Every function's docstring cites its literature source. Parameters are named to 
 | Comboul 2014 | BAM age model | `bam_age_ensemble()` |
 | Cleveland & Devlin 1988 | LOESS locally weighted regression | `loess_trend()` |
 | Sugita 2007 | REVEALS model | Gap documented |
+
+## 📂 Repository Layout
+
+```
+paleoecology-meta-analysis-skill/
+├── SKILL.md                    # TRAE Skill entry (frontmatter + 8 sections)
+├── README.md                   # English documentation (this file)
+├── README_zh-CN.md             # Chinese documentation
+├── LICENSE                     # MIT
+├── CITATION.cff                # Academic citation metadata
+├── requirements.txt            # Python dependencies
+├── .gitignore
+├── .gitattributes
+├── references/                 # 7 methodology reference docs
+│   ├── preprocessing.md        # Ch.3: BAM, z-score, spatial align, bias presets
+│   ├── synthesis_methods.md    # Ch.4: SCC/DCC/CPS/PAI/GAM, BCa, LOESS, ensembles
+│   ├── effect_size.md          # Ch.5: log response ratio, Hedges' d, boundaries
+│   ├── scenarios.md            # Ch.6: 3 scenarios, decision flowchart, dual-channel
+│   ├── validation.md           # Ch.7: assumption tests, 3-layer uncertainty, 6 strategies
+│   ├── python_toolchain.md     # Ch.8: 12 verified tools, version compatibility
+│   └── methodology_gaps.md     # Ch.9-10: 4 gaps, peer-review checklist
+└── scripts/                    # 6 Python modules, 46 functions
+    ├── preprocessing.py        # 7 functions: age ensembles, z-score, auto-clustering
+    ├── continuous_proxy.py     # 6 functions: standardize, calibrate, composite, CV
+    ├── synthesis.py            # 10 functions: 5-method synthesis, Monte Carlo, LOESS
+    ├── effect_size.py          # 7 functions: log RR, Hedges' d, BCa, RMSEP, LOOCV
+    ├── scenarios.py            # 7 functions: 3-scenario orchestration, indicators
+    └── validation.py           # 9 functions: assumption checks, block bootstrap, 3-layer
+```
+
+## ❓ FAQ
+
+<details>
+<summary><b>Can I use this toolkit with marine sediment cores?</b></summary>
+
+Yes. The toolkit is region-agnostic. For marine cores, use `proxy_type='continuous'` for proxies like Mg/Ca or Uk37, and select the `foraminifera-marine` preservation bias preset if working with foraminifera assemblages. The BAM age model works with any sediment type.
+</details>
+
+<details>
+<summary><b>Why is there no R implementation?</b></summary>
+
+R is blocked by Smart App Control on the developer's machine. All methods are implemented in pure Python. BAM (Comboul 2014) replaces Bacon/Clam age models with comparable accuracy. The REVEALS model gap is documented in `references/methodology_gaps.md`.
+</details>
+
+<details>
+<summary><b>How do I import Bacon age model output?</b></summary>
+
+Use `consume_bacon_ages(bacon_output_path)` in `preprocessing.py`. It loads Bacon's age ensemble output (`.txt` or `.csv`, each column is an ensemble member) and returns a standardized dict with `age_ensembles`, `depths`, and `n_members`.
+</details>
+
+<details>
+<summary><b>What if my data violates independence assumptions?</b></summary>
+
+The `validation.py` module provides `check_temporal_independence()` (AR1 + Durbin-Watson) and `check_spatial_independence()` (Moran's I). If violated, use `block_bootstrap()` instead of standard Bootstrap, and `spatial_clustering()` to group nearby sites before synthesis.
+</details>
+
+<details>
+<summary><b>Can I add my own preservation bias preset?</b></summary>
+
+Yes. Pass `sensitive_taxa` and `tolerant_taxa` as lists to `record_preservation_bias()`. You can also extend the `PRESERVATION_BIAS_PRESETS` dictionary in `preprocessing.py` to register a new preset permanently.
+</details>
+
+<details>
+<summary><b>What's the difference between the two channels?</b></summary>
+
+The **taxa channel** handles percentage data (pollen, diatoms, foraminifera) — it uses z-score standardization and five synthesis methods (SCC/DCC/CPS/PAI/GAM). The **continuous channel** handles single-value proxies (δDwax, brGDGTs) — it adds calibration regression, cross-validation, and uses weighted-mean compositing with Monte Carlo ensembles. Both share the same effect-size, validation, and scenario modules.
+</details>
+
+## 🗺️ Roadmap
+
+- [x] v1.0 — Initial release: 5 modules, 40 functions, karst pollen focus
+- [x] v2.0 — Generalization: dual-channel architecture, 6 modules, 46 functions, multi-proxy multi-region
+- [ ] v2.1 — Add example datasets and Jupyter notebook tutorials
+- [ ] v2.2 — PyMC Bayesian GAM implementation (replacing PyGAM for uncertainty quantification)
+- [ ] v3.0 — REVEALS model Python port (collaboration welcome)
+- [ ] v3.1 — Interactive web dashboard for visualization
+
+## 🤝 Contributing
+
+Contributions are welcome! Areas where help is especially needed:
+
+- **REVEALS model Python implementation** — The biggest methodology gap (Sugita 2007)
+- **Bayesian GAM** — PyMC-based replacement for PyGAM, with full posterior uncertainty
+- **Test datasets** — Example sediment core data (anonymized) for tutorials
+- **Additional language translations** — README in Japanese, German, French, Spanish
+- **Bug reports and feature requests** — Open an issue on GitHub
+
+To contribute:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/new-function`)
+3. Ensure all functions have literature-cited docstrings
+4. Verify with `python -m py_compile scripts/*.py`
+5. Submit a pull request
 
 ## 📄 License
 
@@ -308,7 +526,7 @@ If you use this toolkit in your research, please cite:
 }
 ```
 
-Also cite the methodology literature your analysis relies on (see table above).
+Also cite the methodology literature your analysis relies on (see [Literature Foundation](#-literature-foundation)).
 
 ## 🚢 Release Copy
 
