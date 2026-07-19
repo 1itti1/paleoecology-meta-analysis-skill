@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/Version-2.0.0-green.svg)](https://github.com/1itti1/paleoecology-meta-analysis-skill)
+[![Version](https://img.shields.io/badge/Version-2.1.0-green.svg)](https://github.com/1itti1/paleoecology-meta-analysis-skill)
 [![DOI](https://img.shields.io/badge/DOI-cite-orange.svg)](#citation)
 
 > Synthesize multi-site, multi-proxy paleoecological data with peer-review-grade statistical rigor.
@@ -25,6 +25,7 @@ A hybrid meta-analysis toolkit for paleoecology and paleoclimate research. It co
 - [Supported Data Types](#-supported-data-types)
 - [Scenario Selection](#-scenario-selection)
 - [Dual-Channel Architecture](#-dual-channel-architecture)
+- [Hybrid R Bridge](#-hybrid-r-bridge)
 - [Module Reference](#-module-reference)
 - [Statistical Rigor](#-statistical-rigor)
 - [Preservation Bias Presets](#-preservation-bias-presets)
@@ -63,12 +64,12 @@ It is especially useful when working with:
 | Feature | Description |
 |---|---|
 | **Dual-channel architecture** | Separate pipelines for taxon-percentage data (pollen, diatoms) and continuous-value proxies (δDwax, brGDGTs), sharing a common statistical validation framework |
-| **46 functions across 6 modules** | Preprocessing, continuous proxy, synthesis, effect size, scenarios, validation — each function with literature-anchored docstrings |
+| **57 functions across 7 modules** | Preprocessing, continuous proxy, synthesis, effect size, scenarios, validation, R bridge — each function with literature-anchored docstrings |
 | **Three scenario workflows** | Proxy validation, multi-site synthesis, event attribution — each with a complete method chain from raw data to peer-review-ready output |
 | **Three-layer uncertainty propagation** | Age uncertainty (BAM/Bacon ensembles) + calibration uncertainty (RMSEP) + sampling uncertainty (Bootstrap), propagated jointly through 500-member Monte Carlo ensembles |
 | **Five environment presets** | Preservation bias plugins for karst, arid, tropical, lake, and marine environments — auto-selected or manually overridden |
 | **Literature-anchored parameters** | Every default value matches the published source: `n_members=500` (Kaufman 2020), `n_boot=10000` (Izdebski 2022), `n_splines=20` (GAM), `frac=0.2` (LOESS) |
-| **Python-only** | No R dependency. BAM (pure Python) replaces Bacon/Clam age models with comparable accuracy (RMSE 251 yr vs 198 yr) |
+| **Hybrid R bridge** | Optional R + metafor backend for classical meta-analysis (rma, Egger test, forest/funnel plots). Auto-detected; falls back to Python DerSimonian-Laird when R unavailable. No rpy2 dependency |
 | **TRAE Skill compatible** | Drop into `.trae/skills/` for automatic loading in TRAE IDE sessions |
 
 ## 🚀 Quick Start
@@ -204,6 +205,57 @@ The toolkit selects methods based on **data structure**, not discipline preferen
 
 Both channels share `effect_size.py`, `validation.py`, and `scenarios.py` — statistical rigor is consistent regardless of proxy type.
 
+## 🔗 Hybrid R Bridge
+
+Classical meta-analysis functions (random effects pooling, heterogeneity statistics, publication bias tests, forest/funnel plots) are implemented through a **hybrid backend** in `r_bridge.py`:
+
+| Backend | Trigger | Functions | Estimators |
+|---|---|---|---|
+| **metafor** (R) | R 4.0+ + metafor installed | `rma_random_effects`, `meta_regression`, `egger_test`, `forest_plot`, `funnel_plot`, `subgroup_analysis` | REML, ML, DL, EB, HS |
+| **Python** (fallback) | R unavailable or metafor not installed | `rma_random_effects` (DerSimonian-Laird only) | DL |
+
+**How it works:**
+
+```
+Python (NumPy arrays) → JSON → Rscript subprocess → metafor::rma() → JSON → Python (Dict)
+```
+
+No rpy2 dependency. The bridge auto-detects R at first call via `check_r_environment()` and caches the result. Use `get_backend()` to check which backend is active.
+
+**Install R + metafor (optional, recommended):**
+
+```r
+# In R console:
+install.packages("metafor")
+```
+
+When R is available, you get the full metafor feature set (REML estimation, Hartung-Knapp correction, I² heterogeneity, Egger's test, publication-quality forest/funnel plots). When R is absent, the toolkit gracefully falls back to a Python DerSimonian-Laird implementation — your analysis still runs, just with fewer estimator options.
+
+**Example:**
+
+```python
+import sys; sys.path.insert(0, 'scripts')
+import numpy as np
+from r_bridge import rma_random_effects, forest_plot, check_r_environment
+
+# Check backend
+env = check_r_environment()
+print(f"Backend: {env['metafor_ready'] and 'metafor' or 'python'}")
+
+# Random effects meta-analysis
+effect_sizes = np.array([0.35, 0.42, 0.28, 0.51, 0.39])
+variances = np.array([0.08, 0.12, 0.06, 0.10, 0.09])
+result = rma_random_effects(effect_sizes, variances, method='REML', knha=True)
+print(f"Pooled effect: {result['pooled_effect']:.4f}")
+print(f"I²: {result['I2']:.1f}%  τ²: {result['tau2']:.4f}")
+print(f"Backend used: {result['backend']}")
+
+# Forest plot (requires metafor)
+forest_plot(effect_sizes, variances,
+            study_labels=['Site A', 'Site B', 'Site C', 'Site D', 'Site E'],
+            output_path='forest.png')
+```
+
 ## 📦 Module Reference
 
 | Module | Functions | Key functions | Literature basis |
@@ -214,6 +266,7 @@ Both channels share `effect_size.py`, `validation.py`, and `scenarios.py` — st
 | `effect_size.py` | 7 | `log_response_ratio`, `hedges_d`, `effect_size_bca`, `rmsep`, `loocv` | Hedges 1999, Izdebski 2022 |
 | `scenarios.py` | 7 | `scenario1_proxy_validation`, `scenario2_multi_site_synthesis`, `scenario3_human_attribution`, `build_indicators` | All 7 sources |
 | `validation.py` | 9 | `check_normality_bootstrap`, `check_temporal_independence`, `check_spatial_independence`, `propagate_three_layer_uncertainty` | Izdebski 2022, Kaufman 2020 |
+| `r_bridge.py` | 11 | `rma_random_effects`, `meta_regression`, `egger_test`, `forest_plot`, `funnel_plot`, `subgroup_analysis` | Viechtbauer 2010, Hartung & Knapp 2001, Egger 1997 |
 
 **Module dependency chain:**
 
@@ -222,6 +275,7 @@ preprocessing ─┬─→ scenarios
 continuous_proxy┘
 synthesis ─────┘
 effect_size ───┘
+r_bridge ───────┘  (optional: enhances effect_size when R+metafor available)
 validation ────┘  (called by all scenarios)
 ```
 
@@ -389,9 +443,9 @@ print(f"Robust across windows: {robustness['robust']}")
 
 ## 🛠️ Practical Notes
 
-- **Python-only**: R is blocked by Smart App Control on the developer's machine. BAM (pure Python) replaces Bacon/Clam age models — its RMSE of 251 yr is comparable to Bacon's 198 yr (Kaufman 2020 validation).
+- **Hybrid R bridge**: R + metafor are auto-detected at runtime. When available, classical meta-analysis uses metafor (REML, Egger test, forest plots). When absent, a Python DerSimonian-Laird fallback is used. BAM (pure Python) always replaces Bacon/Clam age models — its RMSE of 251 yr is comparable to Bacon's 198 yr (Kaufman 2020 validation).
 - **REVEALS gap**: The REVEALS model (Sugita 2007) has no Python implementation. The toolkit uses z-score standardization as a fallback and documents this gap explicitly in `references/methodology_gaps.md`.
-- **Optional dependencies**: `pygam` (GAM synthesis), `scikit-learn` (k-fold CV), `libpysal`+`esda` (Moran's I) are listed in requirements.txt but not strictly required. The toolkit gracefully degrades when they're absent.
+- **Optional dependencies**: `pygam` (GAM synthesis), `scikit-learn` (k-fold CV), `libpysal`+`esda` (Moran's I), R + `metafor` (classical meta-analysis) are listed in requirements.txt but not strictly required. The toolkit gracefully degrades when they're absent.
 - **Parameter defaults** match published literature: `n_members=500` (Kaufman 2020), `n_boot=10000` (Izdebski 2022), `n_splines=20` (GAM), `frac=0.2` (LOESS, Cleveland & Devlin 1988).
 - **Start small**: Run the smoke test first. Verify the modules import. Then move to a single-core analysis before attempting multi-site synthesis.
 - **Cross-module imports**: `scenarios.py` uses `sys.path.insert` to import other modules. If using modules independently, add the `scripts/` directory to your Python path.
@@ -412,6 +466,10 @@ Every function's docstring cites its literature source. Parameters are named to 
 | Comboul 2014 | BAM age model | `bam_age_ensemble()` |
 | Cleveland & Devlin 1988 | LOESS locally weighted regression | `loess_trend()` |
 | Sugita 2007 | REVEALS model | Gap documented |
+| Viechtbauer 2010 (J Stat Soft) | metafor: meta-analysis framework | `rma_random_effects()`, `forest_plot()` |
+| Hartung & Knapp 2001 (Biometrics) | Hartung-Knapp adjustment | `rma_random_effects(knha=True)` |
+| Higgins & Thompson 2002 (JRSS-A) | I² heterogeneity statistic | `rma_random_effects()` |
+| Egger et al. 1997 (BMJ) | Publication bias test | `egger_test()` |
 
 ## 📂 Repository Layout
 
@@ -433,13 +491,14 @@ paleoecology-meta-analysis-skill/
 │   ├── validation.md           # Ch.7: assumption tests, 3-layer uncertainty, 6 strategies
 │   ├── python_toolchain.md     # Ch.8: 12 verified tools, version compatibility
 │   └── methodology_gaps.md     # Ch.9-10: 4 gaps, peer-review checklist
-└── scripts/                    # 6 Python modules, 46 functions
+└── scripts/                    # 7 Python modules, 57 functions
     ├── preprocessing.py        # 7 functions: age ensembles, z-score, auto-clustering
     ├── continuous_proxy.py     # 6 functions: standardize, calibrate, composite, CV
     ├── synthesis.py            # 10 functions: 5-method synthesis, Monte Carlo, LOESS
     ├── effect_size.py          # 7 functions: log RR, Hedges' d, BCa, RMSEP, LOOCV
     ├── scenarios.py            # 7 functions: 3-scenario orchestration, indicators
-    └── validation.py           # 9 functions: assumption checks, block bootstrap, 3-layer
+    ├── validation.py           # 9 functions: assumption checks, block bootstrap, 3-layer
+    └── r_bridge.py             # 11 functions: R+metafor bridge (rma, Egger, forest, funnel)
 ```
 
 ## ❓ FAQ
@@ -451,9 +510,9 @@ Yes. The toolkit is region-agnostic. For marine cores, use `proxy_type='continuo
 </details>
 
 <details>
-<summary><b>Why is there no R implementation?</b></summary>
+<summary><b>Does this toolkit support R meta-analysis packages?</b></summary>
 
-R is blocked by Smart App Control on the developer's machine. All methods are implemented in pure Python. BAM (Comboul 2014) replaces Bacon/Clam age models with comparable accuracy. The REVEALS model gap is documented in `references/methodology_gaps.md`.
+Yes, since v2.1. The `r_bridge.py` module provides a hybrid backend: when R + metafor are detected, classical meta-analysis functions (rma, Egger test, forest/funnel plots, meta-regression) use metafor via subprocess + JSON. When R is unavailable, the toolkit falls back to a Python DerSimonian-Laird implementation. No rpy2 dependency required. Run `check_r_environment()` to see which backend is active.
 </details>
 
 <details>
@@ -484,8 +543,9 @@ The **taxa channel** handles percentage data (pollen, diatoms, foraminifera) —
 
 - [x] v1.0 — Initial release: 5 modules, 40 functions, karst pollen focus
 - [x] v2.0 — Generalization: dual-channel architecture, 6 modules, 46 functions, multi-proxy multi-region
-- [ ] v2.1 — Add example datasets and Jupyter notebook tutorials
-- [ ] v2.2 — PyMC Bayesian GAM implementation (replacing PyGAM for uncertainty quantification)
+- [x] v2.1 — Hybrid R bridge: metafor integration (rma, Egger, forest/funnel), 7 modules, 57 functions
+- [ ] v2.2 — Add example datasets and Jupyter notebook tutorials
+- [ ] v2.3 — PyMC Bayesian GAM implementation (replacing PyGAM for uncertainty quantification)
 - [ ] v3.0 — REVEALS model Python port (collaboration welcome)
 - [ ] v3.1 — Interactive web dashboard for visualization
 
@@ -532,4 +592,4 @@ Also cite the methodology literature your analysis relies on (see [Literature Fo
 
 - **Repository description**: `A hybrid meta-analysis toolkit for paleoecology and paleoclimate: dual-channel (taxa + continuous proxy) synthesis with BAM age ensembles, Bootstrap BCa uncertainty, and peer-review-grade statistical rigor.`
 - **Tagline**: `Synthesize multi-site, multi-proxy paleoecological data with peer-review-grade statistical rigor.`
-- **Current release**: `v2.0.0 — Dual-channel architecture, multi-region generalization`
+- **Current release**: `v2.1.0 — Hybrid R bridge, metafor integration`

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/Version-2.0.0-green.svg)](https://github.com/1itti1/paleoecology-meta-analysis-skill)
+[![Version](https://img.shields.io/badge/Version-2.1.0-green.svg)](https://github.com/1itti1/paleoecology-meta-analysis-skill)
 [![DOI](https://img.shields.io/badge/DOI-cite-orange.svg)](#引用)
 
 > 以同行评审级的统计严谨性，合成多站点、多代理的古生态学数据。
@@ -25,6 +25,7 @@
 - [支持的数据类型](#-支持的数据类型)
 - [场景选择](#-场景选择)
 - [双通道架构](#-双通道架构)
+- [混合 R 桥接](#-混合-r-桥接)
 - [模块索引](#-模块索引)
 - [统计严谨性](#-统计严谨性)
 - [保存偏倚预设](#-保存偏倚预设)
@@ -63,12 +64,12 @@
 | 特性 | 说明 |
 |---|---|
 | **双通道架构** | 分类群百分比数据（花粉、硅藻）和连续值代理（δDwax、brGDGTs）各有独立流程，共享统一的统计验证框架 |
-| **6 模块 46 个函数** | 预处理、连续值代理、合成、效应量、场景编排、验证——每个函数 docstring 标注文献来源 |
+| **7 模块 57 个函数** | 预处理、连续值代理、合成、效应量、场景编排、验证、R 桥接——每个函数 docstring 标注文献来源 |
 | **三大场景工作流** | 代用指标验证、多站点合成、事件归因——每个场景从原始数据到可发表结论的完整方法链 |
 | **三层不确定性传播** | 年龄不确定性（BAM/Bacon 集合）+ 校准不确定性（RMSEP）+ 采样不确定性（Bootstrap），通过 500 成员蒙特卡洛集合联合传播 |
 | **五种环境预设** | 喀斯特、干旱、热带、湖泊、海洋的保存偏倚插件——自动选择或手动覆盖 |
 | **文献锚定参数** | 每个默认值与发表文献一致：`n_members=500`（Kaufman 2020）、`n_boot=10000`（Izdebski 2022）、`n_splines=20`（GAM）、`frac=0.2`（LOESS） |
-| **纯 Python 实现** | 无 R 依赖。BAM（纯 Python）替代 Bacon/Clam 年龄模型，精度可比（RMSE 251 年 vs 198 年） |
+| **混合 R 桥接** | 可选 R + metafor 后端，支持经典 meta 分析（rma 随机效应、Egger 检验、森林图/漏斗图）。自动检测；R 不可用时回退到 Python DerSimonian-Laird 实现，无需 rpy2 |
 | **兼容 TRAE Skill** | 放入 `.trae/skills/` 即可在 TRAE IDE 会话中自动加载 |
 
 ## 🚀 快速开始
@@ -204,6 +205,57 @@ flowchart LR
 
 两个通道共享 `effect_size.py`、`validation.py` 和 `scenarios.py`——无论代理类型如何，统计严谨性标准一致。
 
+## 🔗 混合 R 桥接
+
+经典 meta 分析功能（随机效应合并、异质性统计、发表偏倚检验、森林图/漏斗图）通过 `r_bridge.py` 模块实现**混合后端**架构：
+
+| 后端 | 触发条件 | 功能范围 | 估计方法 |
+|---|---|---|---|
+| **metafor**（R） | R 4.0+ + metafor 已安装 | rma、meta 回归、Egger 检验、森林图、漏斗图、亚组分析 | REML、ML、DL、EB、HS 五种 |
+| **Python**（回退） | R 不可用或 metafor 未安装 | rma（仅 DerSimonian-Laird） | 仅 DL |
+
+**工作原理：**
+
+```
+Python（NumPy 数组）→ JSON → Rscript 子进程 → metafor::rma() → JSON → Python（Dict）
+```
+
+不依赖 rpy2。首次调用时 `check_r_environment()` 自动检测 R 路径和包状态并缓存结果。`get_backend()` 返回当前激活的后端类型。
+
+**安装 R + metafor（可选，推荐）：**
+
+```r
+# 在 R 控制台执行：
+install.packages("metafor")
+```
+
+R 可用时获得完整 metafor 功能集（REML 估计、Hartung-Knapp 校正、I² 异质性、Egger 检验、可发表质量森林图/漏斗图）。R 不可用时自动回退到 Python DerSimonian-Laird 实现——分析仍可运行，仅估计方法选项较少。
+
+**示例：**
+
+```python
+import sys; sys.path.insert(0, 'scripts')
+import numpy as np
+from r_bridge import rma_random_effects, forest_plot, check_r_environment
+
+# 检查后端
+env = check_r_environment()
+print(f"后端: {env['metafor_ready'] and 'metafor' or 'python'}")
+
+# 随机效应 meta 分析
+effect_sizes = np.array([0.35, 0.42, 0.28, 0.51, 0.39])
+variances = np.array([0.08, 0.12, 0.06, 0.10, 0.09])
+result = rma_random_effects(effect_sizes, variances, method='REML', knha=True)
+print(f"合并效应量: {result['pooled_effect']:.4f}")
+print(f"I²: {result['I2']:.1f}%  τ²: {result['tau2']:.4f}")
+print(f"使用后端: {result['backend']}")
+
+# 森林图（需 metafor）
+forest_plot(effect_sizes, variances,
+            study_labels=['站点 A', '站点 B', '站点 C', '站点 D', '站点 E'],
+            output_path='forest.png')
+```
+
 ## 📦 模块索引
 
 | 模块 | 函数数 | 核心函数 | 文献基础 |
@@ -214,6 +266,7 @@ flowchart LR
 | `effect_size.py` | 7 | `log_response_ratio`, `hedges_d`, `effect_size_bca`, `rmsep`, `loocv` | Hedges 1999, Izdebski 2022 |
 | `scenarios.py` | 7 | `scenario1_proxy_validation`, `scenario2_multi_site_synthesis`, `scenario3_human_attribution`, `build_indicators` | 全部 7 篇 |
 | `validation.py` | 9 | `check_normality_bootstrap`, `check_temporal_independence`, `check_spatial_independence`, `propagate_three_layer_uncertainty` | Izdebski 2022, Kaufman 2020 |
+| `r_bridge.py` | 11 | `rma_random_effects`, `meta_regression`, `egger_test`, `forest_plot`, `funnel_plot`, `subgroup_analysis` | Viechtbauer 2010, Hartung & Knapp 2001, Egger 1997 |
 
 **模块依赖链：**
 
@@ -222,6 +275,7 @@ preprocessing ─┬─→ scenarios
 continuous_proxy┘
 synthesis ─────┘
 effect_size ───┘
+r_bridge ───────┘  （可选：R+metafor 可用时增强 effect_size）
 validation ────┘  （被所有场景调用）
 ```
 
@@ -389,9 +443,9 @@ print(f"跨窗口稳健: {robustness['robust']}")
 
 ## 🛠️ 实用说明
 
-- **纯 Python**：开发者的机器上 R 被 Smart App Control 阻断。BAM（纯 Python）替代 Bacon/Clam 年龄模型——RMSE 251 年与 Bacon 的 198 年可比（Kaufman 2020 验证）。
+- **混合 R 桥接**：运行时自动检测 R + metafor。可用时经典 meta 分析调用 metafor（REML 估计、Egger 检验、森林图）；不可用时回退到 Python DerSimonian-Laird 实现。BAM（纯 Python）始终替代 Bacon/Clam 年龄模型——RMSE 251 年与 Bacon 的 198 年可比（Kaufman 2020 验证）。
 - **REVEALS 缺口**：REVEALS 模型（Sugita 2007）无 Python 实现。工具包用 z-score 标准化作为替代，并在 `references/methodology_gaps.md` 中明确标注此缺口。
-- **可选依赖**：`pygam`（GAM 合成）、`scikit-learn`（k-fold 交叉验证）、`libpysal`+`esda`（Moran's I）在 requirements.txt 中列出但非必需。缺失时工具包优雅降级。
+- **可选依赖**：`pygam`（GAM 合成）、`scikit-learn`（k-fold 交叉验证）、`libpysal`+`esda`（Moran's I）、R + `metafor`（经典 meta 分析）在 requirements.txt 中列出但非必需。缺失时工具包优雅降级。
 - **参数默认值**与发表文献一致：`n_members=500`（Kaufman 2020）、`n_boot=10000`（Izdebski 2022）、`n_splines=20`（GAM）、`frac=0.2`（LOESS, Cleveland & Devlin 1988）。
 - **从小开始**：先运行冒烟测试，确认模块可导入，再进行单站点分析，最后尝试多站点合成。
 - **跨模块导入**：`scenarios.py` 通过 `sys.path.insert` 导入其他模块。独立使用某模块时，需将 `scripts/` 目录加入 Python 路径。
@@ -412,6 +466,10 @@ print(f"跨窗口稳健: {robustness['robust']}")
 | Comboul 2014 | BAM 年龄模型 | `bam_age_ensemble()` |
 | Cleveland & Devlin 1988 | LOESS 局部加权回归 | `loess_trend()` |
 | Sugita 2007 | REVEALS 模型 | 缺口已标注 |
+| Viechtbauer 2010 (J Stat Soft) | metafor：meta 分析框架 | `rma_random_effects()`, `forest_plot()` |
+| Hartung & Knapp 2001 (Biometrics) | Hartung-Knapp 校正 | `rma_random_effects(knha=True)` |
+| Higgins & Thompson 2002 (JRSS-A) | I² 异质性统计量 | `rma_random_effects()` |
+| Egger et al. 1997 (BMJ) | 发表偏倚检验 | `egger_test()` |
 
 ## 📂 仓库结构
 
@@ -433,13 +491,14 @@ paleoecology-meta-analysis-skill/
 │   ├── validation.md           # 第七章：假设检验、三层不确定性、六验证策略
 │   ├── python_toolchain.md     # 第八章：12 项已验证工具、版本兼容性
 │   └── methodology_gaps.md     # 第九+十章：四缺口、同行评审清单
-└── scripts/                    # 6 个 Python 模块，46 个函数
+└── scripts/                    # 7 个 Python 模块，57 个函数
     ├── preprocessing.py        # 7 函数：年龄集合、z-score、自动聚类
     ├── continuous_proxy.py     # 6 函数：标准化、校准、合成、交叉验证
     ├── synthesis.py            # 10 函数：五方法合成、蒙特卡洛、LOESS
     ├── effect_size.py          # 7 函数：log RR、Hedges' d、BCa、RMSEP、LOOCV
     ├── scenarios.py            # 7 函数：三场景编排、指标构建
-    └── validation.py           # 9 函数：假设检验、块 Bootstrap、三层传播
+    ├── validation.py           # 9 函数：假设检验、块 Bootstrap、三层传播
+    └── r_bridge.py             # 11 函数：R+metafor 桥接（rma、Egger、森林图、漏斗图）
 ```
 
 ## ❓ 常见问题
@@ -451,9 +510,9 @@ paleoecology-meta-analysis-skill/
 </details>
 
 <details>
-<summary><b>为什么没有 R 实现？</b></summary>
+<summary><b>是否支持 R meta 分析包？</b></summary>
 
-开发者的机器上 R 被 Smart App Control 阻断。所有方法均用纯 Python 实现。BAM（Comboul 2014）替代 Bacon/Clam 年龄模型，精度可比。REVEALS 模型缺口在 `references/methodology_gaps.md` 中有说明。
+自 v2.1 起支持。`r_bridge.py` 模块提供混合后端：检测到 R + metafor 时，经典 meta 分析功能（rma、Egger 检验、森林图/漏斗图、meta 回归）通过 subprocess + JSON 调用 metafor。R 不可用时回退到 Python DerSimonian-Laird 实现。无需 rpy2 依赖。运行 `check_r_environment()` 查看当前后端。
 </details>
 
 <details>
@@ -484,8 +543,9 @@ paleoecology-meta-analysis-skill/
 
 - [x] v1.0 — 初始版本：5 模块、40 函数、聚焦喀斯特花粉
 - [x] v2.0 — 普适化：双通道架构、6 模块、46 函数、多代理多区域
-- [ ] v2.1 — 添加示例数据集和 Jupyter notebook 教程
-- [ ] v2.2 — PyMC 贝叶斯 GAM 实现（替代 PyGAM，提供完整后验不确定性）
+- [x] v2.1 — 混合 R 桥接：metafor 集成（rma、Egger、森林图/漏斗图）、7 模块、57 函数
+- [ ] v2.2 — 添加示例数据集和 Jupyter notebook 教程
+- [ ] v2.3 — PyMC 贝叶斯 GAM 实现（替代 PyGAM，提供完整后验不确定性）
 - [ ] v3.0 — REVEALS 模型 Python 移植（欢迎协作）
 - [ ] v3.1 — 交互式 Web 可视化面板
 
@@ -532,4 +592,4 @@ paleoecology-meta-analysis-skill/
 
 - **仓库描述**：`面向古生态学与古气候学的混合方法 meta 分析工具包：双通道（分类群+连续值代理）合成，支持 BAM 年龄集合、Bootstrap BCa 不确定性、同行评审级统计严谨性。`
 - **标语**：`以同行评审级的统计严谨性，合成多站点、多代理的古生态学数据。`
-- **当前版本**：`v2.0.0 — 双通道架构，多区域普适化`
+- **当前版本**：`v2.1.0 — 混合 R 桥接，metafor 集成`

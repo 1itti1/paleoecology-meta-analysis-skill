@@ -1,4 +1,4 @@
-# 核心依赖（6 个脚本均需）
+# 核心依赖（7 个脚本均需）
 numpy>=1.21
 pandas>=1.3
 scipy>=1.7
@@ -13,6 +13,13 @@ scikit-learn>=1.0
 # 空间独立性检验可选依赖（check_spatial_independence 需要）
 libpysal>=4.6
 esda>=2.4
+
+# R 桥接可选依赖（r_bridge.py 的 metafor 后端需要）
+# 安装 R 4.0+: https://cran.r-project.org/
+# 在 R 中执行: install.packages("metafor")
+# 未安装时自动回退到 Python DerSimonian-Laird 实现
+# R>=4.0
+# metafor>=3.0
 
 # 贝叶斯扩展（可选，贝叶斯 GAM 报告）
 # pymc>=5.0
