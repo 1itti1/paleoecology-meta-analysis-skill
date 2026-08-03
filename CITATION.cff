@@ -5,7 +5,7 @@ type: software
 authors:
   - given-names: "paleoecology-research"
 title-alternative: "面向多站点古生态学与古气候代理记录的通用可复现合成工作流"
-version: "2.2.0"
+version: "2.3.0"
 date-released: "2026-08-03"
 license: MIT
 repository-code: "https://github.com/1itti1/paleoecology-meta-analysis-skill"
@@ -19,6 +19,8 @@ keywords:
   - effect-size
   - continuous-proxy
   - dual-channel
+  - proxy-clustered-synthesis
+  - leave-one-proxy-out
   - metafor
   - r-bridge
 preferred-citation:
@@ -26,6 +28,6 @@ preferred-citation:
   title: "Paleoecology Meta-Analysis Skill"
   authors:
     - given-names: "paleoecology-research"
-  version: "2.2.0"
+  version: "2.3.0"
   date-released: "2026-08-03"
   license: MIT

@@ -6,9 +6,18 @@ proxy-agnostic: pollen, diatoms, foraminifera, plant macrofossils, charcoal,
 biomarkers, isotopes, and other stratigraphic records can use the same data
 contract while retaining archive-specific assumptions.
 
-> Development release: 2.2.0. The package is a reproducible starting point,
+> Development release: 2.3.0. The package is a reproducible starting point,
 > not a substitute for archive-specific age modelling, proxy ecology, or
 > expert review.
+
+## What changed in 2.3
+
+- Added a proxy-level contract and a conservative heterogeneous-proxy
+  synthesis layer. It standardizes and orients each record, aligns chronologies,
+  combines proxies within site, and combines sites without double-counting an
+  archive.
+- Added site-cluster bootstrap, optional standardized measurement-error
+  correlation, proxy concordance diagnostics, and leave-one-proxy-out checks.
 
 ## What changed in 2.2
 
@@ -31,6 +40,9 @@ contract while retaining archive-specific assumptions.
 - validating paired proxy predictions against observations;
 - propagating chronology, calibration, and sampling uncertainty;
 - checking temporal/spatial dependence and leave-one-site-out sensitivity;
+- combining pollen, charcoal, isotopes, biomarkers, or other proxies only when
+  they have a defensible common target;
+- checking proxy disagreement and leave-one-proxy-out sensitivity;
 - comparing climate and human-activity indicators without overstating causality.
 
 ## Core guardrails
@@ -50,6 +62,8 @@ contract while retaining archive-specific assumptions.
    model is specified.
 8. Report before/after results as associations, not causal effects, unless the
    design includes a counterfactual, controls, and dependence-aware modelling.
+9. Keep all proxies from one archive in one site bootstrap cluster. A larger
+   number of measured proxies does not create more independent regional sites.
 
 ## Quick start
 
@@ -102,6 +116,50 @@ perturbed = age_ensemble_from_errors(
 )
 ```
 
+For heterogeneous proxies with a shared target, use the explicit proxy-level
+workflow:
+
+```python
+import numpy as np
+
+from scripts.multi_proxy import multi_proxy_synthesis, leave_one_proxy_out
+
+records = [
+    {
+        "site_id": "core_A",
+        "proxy_id": "pollen",
+        "proxy_type": "taxa",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([12., 18., 24.]),
+        "direction": "positive",
+        "measurement_error": 0.5,
+    },
+    {
+        "site_id": "core_A",
+        "proxy_id": "charcoal",
+        "proxy_type": "continuous",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([8., 5., 2.]),
+        "direction": "negative",
+        "measurement_error": 0.2,
+    },
+]
+
+result = multi_proxy_synthesis(
+    records,
+    np.array([0., 50., 100., 150., 200.]),
+    n_members=500,
+    random_state=42,
+)
+loo = leave_one_proxy_out(records, np.array([0., 50., 100., 150., 200.]))
+```
+
+This is a transparent common-target evidence synthesis, not a latent-variable,
+REVEALS, or proxy-specific forward model. Different targets must be analyzed
+separately and compared in a joint temporal framework.
+
 ## Data contract
 
 Each observation should retain `site_id`, `sample_id`, `age`, optional `depth`,
@@ -111,6 +169,11 @@ pass ragged per-site arrays rather than padding with zeros. A per-site age
 ensemble is represented as members × samples; a shared ensemble is valid only
 when the chronology truly applies to every site.
 
+For multi-proxy analyses, use one record per `site_id` × `proxy_id` and retain
+`proxy_type`, `target`, `direction`, `unit`, `measurement_error`, `weight`,
+`site_weight`, and `chronology_group`. Do not combine records with different
+targets or silently infer the direction of a proxy response.
+
 ## Modules
 
 | Module | Purpose |
@@ -118,6 +181,7 @@ when the chronology truly applies to every site.
 | `scripts/preprocessing.py` | Age-ensemble consumption, perturbation sensitivity, standardization, safe interpolation, naming, bias documentation |
 | `scripts/synthesis.py` | SCC, DCC, CPS, PAI, descriptive GAM/LOESS, Monte Carlo ensembles |
 | `scripts/continuous_proxy.py` | Calibration, ragged-site synthesis, uncertainty, time-aware validation, paired comparison |
+| `scripts/multi_proxy.py` | Proxy-level validation, target/direction harmonization, site-clustered synthesis, correlated error propagation, concordance, leave-one-proxy-out |
 | `scripts/effect_size.py` | Paired log-ratio, Hedges' g, BCa/percentile intervals, RMSEP, LOOCV |
 | `scripts/scenarios.py` | Paired validation, multi-site synthesis, and event-window association workflows |
 | `scripts/validation.py` | Normality diagnostics, temporal/spatial dependence, moving-block bootstrap, sensitivity |
@@ -146,8 +210,9 @@ python -m unittest discover -s tests -v
 
 The tests cover all public module imports and the highest-risk paths: safe
 interpolation, missing-weight handling, age perturbation labelling, effect-size
-intervals, ragged continuous sites, event bootstrap callbacks, and moving-block
-bootstrap.
+intervals, ragged continuous sites, mixed-proxy site clustering, correlated
+measurement error, leave-one-proxy-out sensitivity, event bootstrap callbacks,
+and moving-block bootstrap.
 
 ## References
 

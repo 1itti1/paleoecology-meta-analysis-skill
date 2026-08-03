@@ -37,6 +37,23 @@ model. Coordinate distance, pollen source area, site selection, and unequal
 record density can all affect regional estimates. Report site count per bin and
 perform site-weight and spatial-neighborhood sensitivity analyses.
 
+## Heterogeneous proxy synthesis
+
+`multi_proxy_synthesis()` implements a deliberately transparent common-target
+estimand: each proxy record is standardized and oriented, proxies are combined
+within site, and sites are combined regionally. It does not infer a latent
+environmental state, estimate proxy-specific observation equations, or identify
+causal attribution. Different targets, such as hydroclimate and human activity,
+must not be pooled into one composite.
+
+The optional measurement-correlation argument only propagates correlations in
+standardized measurement-error draws within a site. It does not recover shared
+age-depth covariance, transport covariance, preservation covariance, or process
+covariance. For those estimands use an explicit multivariate or hierarchical
+model and report its likelihood, priors, covariance structure, and sensitivity.
+Always inspect proxy concordance and leave-one-proxy-out sensitivity before
+interpreting a composite.
+
 ## Reporting checklist
 
 - state the estimand and unit of replication;
@@ -46,5 +63,8 @@ perform site-weight and spatial-neighborhood sensitivity analyses.
   and Bayesian credible intervals;
 - report missingness, extrapolation policy, effective site count, random seed,
   and backend;
+- report the common target, proxy direction, per-proxy standardization,
+  within-site/among-site weights, proxy concordance, and leave-one-proxy-out
+  sensitivity;
 - separate descriptive association from causal claims;
 - include archive-specific limitations and alternative explanations.

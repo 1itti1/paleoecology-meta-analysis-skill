@@ -6,6 +6,11 @@ import numpy as np
 
 from scripts.continuous_proxy import composite_continuous_proxy, proxy_comparison
 from scripts.effect_size import effect_size_bca, hedges_d
+from scripts.multi_proxy import (
+    leave_one_proxy_out,
+    multi_proxy_synthesis,
+    prepare_proxy_records,
+)
 from scripts.preprocessing import age_ensemble_from_errors, resample_to_grid
 from scripts.scenarios import scenario2_multi_site_synthesis, scenario3_human_attribution
 from scripts.synthesis import scc_composite
@@ -79,6 +84,123 @@ class CoreWorkflowTests(unittest.TestCase):
             proxy_type='continuous', synthesis_method='weighted_mean',
         )
         self.assertEqual(result['composite'].shape, (4,))
+
+    def test_multi_proxy_synthesis_clusters_proxies_by_site(self):
+        records = [
+            {
+                'site_id': 'A',
+                'proxy_id': 'pollen',
+                'proxy_type': 'taxa',
+                'target': 'vegetation_change',
+                'ages': np.array([0.0, 100.0, 200.0, 300.0]),
+                'values': np.array([1.0, 2.0, 3.0, 4.0]),
+                'age_ensembles': np.array([
+                    [0.0, 100.0, 200.0, 300.0],
+                    [1.0, 101.0, 201.0, 301.0],
+                ]),
+                'measurement_error': 0.05,
+                'site_weight': 2.0,
+            },
+            {
+                'site_id': 'A',
+                'proxy_id': 'charcoal',
+                'proxy_type': 'continuous',
+                'target': 'vegetation_change',
+                'direction': 'negative',
+                'ages': np.array([0.0, 150.0, 300.0]),
+                'values': np.array([4.0, 3.0, 1.0]),
+                'measurement_error': 0.10,
+                'site_weight': 2.0,
+            },
+            {
+                'site_id': 'B',
+                'proxy_id': 'pollen',
+                'proxy_type': 'taxa',
+                'target': 'vegetation_change',
+                'ages': np.array([0.0, 120.0, 240.0, 360.0]),
+                'values': np.array([0.5, 1.5, 2.5, 3.5]),
+                'measurement_error': 0.05,
+            },
+            {
+                'site_id': 'B',
+                'proxy_id': 'charcoal',
+                'proxy_type': 'continuous',
+                'target': 'vegetation_change',
+                'direction': 'negative',
+                'ages': np.array([0.0, 180.0, 360.0]),
+                'values': np.array([3.5, 2.5, 1.0]),
+                'measurement_error': 0.10,
+            },
+        ]
+        grid = np.array([-20.0, 0.0, 60.0, 180.0, 320.0, 400.0])
+        result = multi_proxy_synthesis(
+            records,
+            grid,
+            weighting='precision',
+            measurement_correlation={('pollen', 'charcoal'): 0.25},
+            n_members=40,
+            random_state=7,
+        )
+        self.assertEqual(result['n_sites'], 2)
+        self.assertEqual(result['n_proxies'], 2)
+        self.assertEqual(result['ensembles'].shape, (40, len(grid)))
+        self.assertTrue(np.isnan(result['composite'][0]))
+        self.assertTrue(np.isnan(result['composite'][-1]))
+        self.assertEqual(result['bootstrap_unit'], 'site_cluster')
+        self.assertIn('pollen__vs__charcoal', result['proxy_concordance']['pairs'])
+        self.assertEqual(result['effective_proxy_count'][2], 2)
+
+    def test_multi_proxy_rejects_mixed_targets(self):
+        base = {
+            'site_id': 'A',
+            'ages': np.array([0.0, 1.0, 2.0]),
+            'values': np.array([1.0, 2.0, 3.0]),
+        }
+        records = [
+            dict(base, proxy_id='pollen', target='climate'),
+            dict(base, site_id='B', proxy_id='charcoal', target='human_activity'),
+        ]
+        with self.assertRaises(ValueError):
+            prepare_proxy_records(records)
+        no_target = [
+            dict(base, proxy_id='pollen'),
+            dict(base, site_id='B', proxy_id='charcoal'),
+        ]
+        with self.assertRaises(ValueError):
+            multi_proxy_synthesis(no_target, np.array([0.0, 1.0, 2.0]), bootstrap_sites=False)
+
+    def test_leave_one_proxy_out_is_deterministic(self):
+        records = [
+            {
+                'site_id': 'A', 'proxy_id': 'pollen', 'target': 'shared',
+                'ages': np.array([0.0, 100.0, 200.0]),
+                'values': np.array([0.0, 1.0, 2.0]),
+            },
+            {
+                'site_id': 'A', 'proxy_id': 'isotope', 'target': 'shared',
+                'ages': np.array([0.0, 100.0, 200.0]),
+                'values': np.array([0.0, 2.0, 4.0]),
+            },
+            {
+                'site_id': 'B', 'proxy_id': 'pollen', 'target': 'shared',
+                'ages': np.array([0.0, 100.0, 200.0]),
+                'values': np.array([1.0, 2.0, 3.0]),
+            },
+            {
+                'site_id': 'B', 'proxy_id': 'isotope', 'target': 'shared',
+                'ages': np.array([0.0, 100.0, 200.0]),
+                'values': np.array([2.0, 3.0, 4.0]),
+            },
+        ]
+        result = leave_one_proxy_out(
+            records,
+            np.array([0.0, 100.0, 200.0]),
+            measurement_correlation={('pollen', 'isotope'): 0.25},
+        )
+        self.assertFalse(result['stochastic'])
+        self.assertEqual(set(result['by_excluded_proxy']), {'pollen', 'isotope'})
+        for summary in result['by_excluded_proxy'].values():
+            self.assertTrue(np.isfinite(summary['rmse']))
 
     def test_block_bootstrap_has_explicit_method(self):
         result = block_bootstrap(

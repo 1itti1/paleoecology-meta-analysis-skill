@@ -1,7 +1,7 @@
 interface:
   display_name: "Paleoecology Meta-Analysis"
-  short_description: "Generic proxy synthesis with chronology uncertainty"
-  default_prompt: "Use $paleoecology-meta-analysis to audit and synthesize my multi-site paleoecology data with explicit uncertainty and reproducible checks."
+  short_description: "Multi-proxy synthesis with chronology uncertainty"
+  default_prompt: "Use $paleoecology-meta-analysis to audit, align, and synthesize my multi-proxy paleoecology data with site-clustered uncertainty and reproducible checks."
 
 policy:
   allow_implicit_invocation: true

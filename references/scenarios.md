@@ -28,7 +28,37 @@ The workflow is:
 SCC, CPS, GAM, and weighted mean are alternative sensitivity methods. A GAM
 output is the `predicted` curve.
 
-## 3. Event-window comparison
+## 3. Heterogeneous multi-proxy synthesis
+
+Use `scripts.multi_proxy.prepare_proxy_records()` and
+`scripts.multi_proxy.multi_proxy_synthesis()` when several proxy types are
+intended to inform one declared target. Provide one record per `site_id` ×
+`proxy_id`, including `target`, `direction`, `unit`, and any measurement error.
+The function retains raw values and creates a transformed value separately.
+
+The estimand is deliberately two-stage:
+
+1. standardize, orient, and align each proxy record;
+2. combine proxies within site, then combine site composites regionally.
+
+This prevents a site with four proxies from receiving four times the regional
+weight of a site with one proxy. `site_weight` controls the second stage and
+`weight` controls the within-site proxy stage. `weighting='precision'` uses the
+median positive standardized measurement error as an optional precision factor;
+use it only when the reported errors are comparable and defensible.
+
+`measurement_correlation` is an optional correlation matrix or pair mapping for
+standardized measurement-error draws within a site. It does not model shared
+chronology error or proxy-process covariance. Use `chronology_group` and common
+age-ensemble member indices for shared chronology structure, and use an
+archive-specific hierarchical model when covariance is central to the
+estimand.
+
+Inspect `proxy_concordance`, coverage counts, and the uncertainty-layer labels.
+Run `leave_one_proxy_out()` before interpreting a common composite. Proxy
+agreement is descriptive evidence, not proof of a common latent mechanism.
+
+## 4. Event-window comparison
 
 Use `scenario3_human_attribution()` and `before_after_test()` to compare windows
 around a declared event. The bootstrap statistic accepts separate before and

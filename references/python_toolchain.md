@@ -35,6 +35,10 @@ ensemble size, not a universal requirement.
 
 There is no generic Python implementation here for REVEALS, pollen source-area
 models, archive-specific Bayesian age-depth modelling, compositional count
-models, or full spatial hierarchical synthesis. Use a validated external
-backend or state the limitation; do not replace a missing model with a z-score
-and call it equivalent.
+models, latent-variable proxy models, correlated multivariate random-effects
+meta-analysis, or full spatial hierarchical synthesis. The bundled
+`multi_proxy.py` module is a transparent common-target, site-clustered evidence
+synthesis with optional standardized measurement-error correlation; it is not a
+substitute for those models. Use a validated external backend or state the
+limitation; do not replace a missing model with a z-score and call it
+equivalent.

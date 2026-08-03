@@ -3,9 +3,10 @@ name: paleoecology-meta-analysis
 description: >-
   Generic, reproducible synthesis of multi-site paleoecology and paleoclimate
   proxy records. Use for data audits, chronology-ensemble alignment, taxa or
-  continuous-proxy standardization, regional time-series synthesis, paired
-  proxy validation, uncertainty propagation, dependence checks, and cautious
-  climate-versus-human-activity comparisons. Supports pollen, diatoms,
+  continuous-proxy standardization, multi-proxy common-target synthesis,
+  regional time-series synthesis, leave-one-proxy validation, uncertainty
+  propagation, dependence checks, and cautious climate-versus-human-activity
+  comparisons. Supports pollen, diatoms,
   foraminifera, plant macrofossils, charcoal, biomarkers, isotopes, and other
   stratigraphic proxies without assuming a region, archive, proxy calibration,
   or causal interpretation.
@@ -38,6 +39,9 @@ interpretations separate.
    missingness, excluded samples, and all sensitivity choices.
 10. Fail loudly on invalid shapes, non-positive variances, missing time axes,
     unsupported age layouts, and non-finite effect-size inputs.
+11. Do not combine proxies with different targets. Keep all proxies from one
+    archive in one site bootstrap cluster unless a design explicitly justifies
+    a different unit of replication.
 
 ## Required data contract
 
@@ -55,6 +59,13 @@ Normalize inputs to a table or dictionary with these fields before analysis:
 | `count_sum` | Required for count-based taxa data when available |
 | `lat`, `lon`, `elevation` | Required only for spatial analyses |
 | `source`, `method`, `unit` | Provenance and measurement metadata |
+
+For a heterogeneous multi-proxy synthesis, use one record per `site_id` ×
+`proxy_id` and add `proxy_type`, `target`, `direction`, `measurement_error`,
+`weight`, `site_weight`, and `chronology_group`. `target` must identify the
+common construct being synthesized (for example, hydroclimate or fire
+activity), not merely the study region. `direction` must make a larger
+transformed value support the same target interpretation across proxies.
 
 For ragged multi-site data, keep a list of per-site arrays or long-form rows.
 Do not pad observations with zeros. Use `NaN` only for genuinely missing values.
@@ -137,9 +148,31 @@ For continuous proxies, use `composite_continuous_proxy` with ragged per-site
 arrays or a documented common shape. A shared age ensemble is valid only when
 the same chronology applies to all sites; otherwise pass one ensemble per site.
 
+For genuinely heterogeneous proxies, use `scripts/multi_proxy.py`:
+
+1. Call `prepare_proxy_records()` to validate the proxy-level contract while
+   preserving raw values.
+2. Use `multi_proxy_synthesis()` only when records have a defensible common
+   target. It standardizes and orients each record, aligns each chronology,
+   combines proxies within site, and then combines sites.
+3. Treat `measurement_correlation` as standardized measurement-error
+   correlation within a site; provide it only when supported by the data.
+4. Inspect `proxy_concordance`, `effective_proxy_count`, and
+   `effective_site_count`. A composite is not evidence that disagreeing proxies
+   measure one latent process.
+5. Run `leave_one_proxy_out()` and report proxy-specific sensitivity. Do not
+   use a common z-score to erase proxy-specific calibration, transport,
+   preservation, or ecological mechanisms.
+
+This common-target synthesis is a transparent evidence-combination layer. It
+is not a proxy forward model, REVEALS, a latent-variable model, or a causal
+multi-proxy attribution model. Use an archive-specific or hierarchical model
+when the estimand requires those mechanisms.
+
 ### 6. Propagate uncertainty
 
-Use `monte_carlo_ensemble`, `propagate_continuous_uncertainty`, or
+Use `monte_carlo_ensemble`, `propagate_continuous_uncertainty`,
+`multi_proxy_synthesis`, or
 `propagate_three_layer_uncertainty` only after specifying which uncertainty
 layers are actually available:
 
@@ -162,6 +195,8 @@ Run the relevant checks in `validation.py`:
 - block or moving-block bootstrap for dependent series;
 - leave-one-site-out and parameter sensitivity checks;
 - multiple windows, indicators, taxa, or proxies with multiplicity acknowledged.
+- leave-one-proxy-out sensitivity and proxy disagreement diagnostics for any
+  heterogeneous synthesis.
 
 Normality tests are diagnostics, not a prerequisite for every bootstrap. Do not
 use arbitrary p-value thresholds as the sole robustness criterion.
@@ -192,6 +227,9 @@ joint temporal framework when the scientific question is attribution.
   Carlo ensembles, and method sensitivity.
 - `scripts/continuous_proxy.py`: continuous-proxy calibration, ragged-site
   synthesis, uncertainty, validation, and paired comparison.
+- `scripts/multi_proxy.py`: proxy-level data contract, target/direction
+  harmonization, site-clustered common-target synthesis, correlated
+  measurement-error propagation, concordance, and leave-one-proxy-out checks.
 - `scripts/effect_size.py`: paired log-ratios, Hedges' g, BCa/percentile
   intervals, RMSEP, and LOOCV. Use only when the design supports it.
 - `scripts/scenarios.py`: explicit orchestration for paired, stacked, and

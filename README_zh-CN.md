@@ -5,8 +5,15 @@
 化石、炭屑、生物标志物、同位素和其他地层代理均可使用统一数据契约，
 同时保留各自的生态学和年代学假设。
 
-> 开发版本：2.2.0。本项目是可复现的分析起点，不替代档案专属年代模型、
+> 开发版本：2.3.0。本项目是可复现的分析起点，不替代档案专属年代模型、
 > 代理生态学判断或专家审查。
+
+## 2.3 版主要改进
+
+- 增加代理级数据契约和异质代理综合层：分别标准化、统一方向、时间对齐，
+  先在站点内整合代理，再在站点间进行区域合成，避免同一档案被重复计权。
+- 增加按站点聚类的 bootstrap、可选的标准化测量误差相关性、代理一致性诊断
+  和逐代理剔除敏感性分析。
 
 ## 2.2 版主要改进
 
@@ -29,6 +36,8 @@
 - 代理预测值与观测值的配对验证；
 - 年代、校准和采样不确定性传播；
 - 时间/空间依赖检验和逐站点剔除敏感性分析；
+- 只有在具有可辩护共同目标时，才联合花粉、炭屑、同位素、生物标志物等代理；
+- 检查代理冲突并进行逐代理剔除敏感性分析；
 - 在不夸大因果性的前提下比较气候和人类活动指标。
 
 ## 核心约束
@@ -43,6 +52,8 @@
    相关时间序列叠加。
 7. GAM/LOESS 默认是描述性平滑，除非另外提供完整推断模型。
 8. 事件前后差异默认是关联，不是因果效应。
+9. 同一档案的多个代理必须作为一个站点 bootstrap 簇；代理数量增加不等于
+   区域独立站点数量增加。
 
 ## 快速开始
 
@@ -92,6 +103,48 @@ perturbed = age_ensemble_from_errors(
 )
 ```
 
+对于具有共同目标的异质代理，可使用明确的代理级工作流：
+
+```python
+import numpy as np
+
+from scripts.multi_proxy import multi_proxy_synthesis, leave_one_proxy_out
+
+records = [
+    {
+        "site_id": "core_A",
+        "proxy_id": "pollen",
+        "proxy_type": "taxa",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([12., 18., 24.]),
+        "direction": "positive",
+        "measurement_error": 0.5,
+    },
+    {
+        "site_id": "core_A",
+        "proxy_id": "charcoal",
+        "proxy_type": "continuous",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([8., 5., 2.]),
+        "direction": "negative",
+        "measurement_error": 0.2,
+    },
+]
+
+result = multi_proxy_synthesis(
+    records,
+    np.array([0., 50., 100., 150., 200.]),
+    n_members=500,
+    random_state=42,
+)
+loo = leave_one_proxy_out(records, np.array([0., 50., 100., 150., 200.]))
+```
+
+这是透明的共同目标证据合成，不是潜变量模型、REVEALS 或代理专属前向模型。
+不同目标必须分开分析，再在共同时间框架下比较。
+
 ## 数据契约
 
 每条观测尽量保留 `site_id`、`sample_id`、`age`、可选的 `depth`、原始代理
@@ -100,6 +153,11 @@ perturbed = age_ensemble_from_errors(
 年龄集合形状为 members × samples；只有在所有站点确实共用同一年代时，才可
 使用共享年龄集合。
 
+多代理分析应为每个 `site_id` × `proxy_id` 建立一条记录，并保留
+`proxy_type`、`target`、`direction`、`unit`、`measurement_error`、`weight`、
+`site_weight` 和 `chronology_group`。不能合并不同目标，也不能静默推断代理
+方向。
+
 ## 模块
 
 | 模块 | 功能 |
@@ -107,6 +165,7 @@ perturbed = age_ensemble_from_errors(
 | `scripts/preprocessing.py` | 年龄集合读取、扰动敏感性、标准化、安全插值、命名和保存偏倚记录 |
 | `scripts/synthesis.py` | SCC、DCC、CPS、PAI、描述性 GAM/LOESS 和蒙特卡洛集合 |
 | `scripts/continuous_proxy.py` | 校准、不等长站点合成、不确定性、时间序列验证和双代理比较 |
+| `scripts/multi_proxy.py` | 代理级校验、目标/方向统一、按站点聚类合成、相关误差传播、一致性和逐代理剔除 |
 | `scripts/effect_size.py` | 配对 log-ratio、Hedges' g、BCa/percentile 区间、RMSEP、LOOCV |
 | `scripts/scenarios.py` | 配对验证、多站点合成和事件窗口关联分析 |
 | `scripts/validation.py` | 正态性诊断、时间/空间依赖、移动块 bootstrap 和敏感性分析 |
