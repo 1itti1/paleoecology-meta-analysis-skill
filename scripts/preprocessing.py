@@ -1,22 +1,41 @@
 """
 古生态学与古气候学数据预处理模块（多代理、多区域通用）。
-涵盖 BAM 年龄模型、z-score 标准化、时空对齐、分类群命名统一、保存偏倚记录。
+涵盖外部年龄集合消费、年代点扰动敏感性、z-score 标准化、时空对齐、
+分类群命名统一和保存偏倚记录。
 
 支持两类代理数据：
 - 分类群百分比型（花粉、孢粉、硅藻、有孔虫等）：harmonize_names / record_preservation_bias
 - 连续值型（δDwax、brGDGTs、粒度、有机碳等）：见 continuous_proxy.py
 
 文献来源：
-- Comboul 2014 [9]: BAM 年龄模型
+- 外部年龄模型：本模块只消费其年龄集合，不替代档案专属建模
 - Kaufman 2020 [2]: 时空对齐、年龄集合消费
 - Izdebski 2022 [1]: z-score 标准化、地理区域聚类
 - Power 2008 [4]: z-score 标准化
 """
 
 from typing import Dict, List, Optional, Tuple, Union
+import warnings
 
 import numpy as np
 import pandas as pd
+
+try:
+    from ._utils import (
+        as_float_array,
+        get_rng,
+        interpolate_no_extrapolation,
+        validate_age_ensembles,
+        validate_same_length,
+    )
+except ImportError:  # pragma: no cover - supports direct script imports
+    from _utils import (
+        as_float_array,
+        get_rng,
+        interpolate_no_extrapolation,
+        validate_age_ensembles,
+        validate_same_length,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -52,51 +71,70 @@ PRESERVATION_BIAS_PRESETS: Dict[str, Dict] = {
 }
 
 
+def age_ensemble_from_errors(
+    depths: np.ndarray,
+    ages: np.ndarray,
+    age_errors: np.ndarray,
+    n_members: int = 500,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
+) -> Dict:
+    """Generate a transparent horizon-perturbation age ensemble.
+
+    This is *not* an age-depth model. It perturbs dated horizons by their
+    reported errors and enforces monotonicity as a sensitivity analysis. Use a
+    posterior from an archive-specific chronology model whenever possible.
+    """
+    depth_arr = as_float_array(depths, 'depths', ndim=1, allow_nan=False, min_size=2)
+    age_arr = as_float_array(ages, 'ages', ndim=1, allow_nan=False, min_size=2)
+    error_arr = as_float_array(age_errors, 'age_errors', ndim=1, allow_nan=False, min_size=2)
+    validate_same_length(('depths', depth_arr), ('ages', age_arr), ('age_errors', error_arr))
+    if n_members < 2:
+        raise ValueError('n_members 至少需要 2。')
+    if np.any(error_arr < 0):
+        raise ValueError('age_errors 必须非负。')
+
+    order = np.argsort(depth_arr, kind='mergesort')
+    depth_arr, age_arr, error_arr = depth_arr[order], age_arr[order], error_arr[order]
+    direction = 1.0 if age_arr[-1] >= age_arr[0] else -1.0
+    rng = get_rng(random_state)
+    ensembles = np.empty((n_members, len(age_arr)), dtype=float)
+
+    for i in range(n_members):
+        perturbed = age_arr + rng.normal(0.0, error_arr)
+        directed = direction * perturbed
+        directed = np.maximum.accumulate(directed)
+        ensembles[i] = direction * directed
+
+    return {
+        'age_ensembles': ensembles,
+        'n_members': n_members,
+        'method': 'age_perturbation',
+        'depths': depth_arr,
+        'random_state': random_state if isinstance(random_state, int) else None,
+        'warning': '这是年龄点扰动敏感性分析，不是 BAM/Bacon/Clam 年龄模型。',
+    }
+
+
 def bam_age_ensemble(
     depths: np.ndarray,
     ages: np.ndarray,
     age_errors: np.ndarray,
     n_members: int = 500,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
-    """Comboul 2014 BAM 年龄模型：生成蒙特卡洛年龄集合。
+    """Backward-compatible alias for :func:`age_ensemble_from_errors`.
 
-    从年龄-深度数据生成年龄集合，每个成员保持地层单调性。
-    BAM 的 RMSE 为 251 年，与 Bacon (198 年) 可比 (Kaufman 2020)。
-    适用于任意区域、任意沉积物类型（湖泊、海洋、泥炭、石笋等）。
-
-    Parameters
-    ----------
-    depths : np.ndarray
-        沉积深度数组 (n_depths,)。
-    ages : np.ndarray
-        对应年龄数组 (n_depths,)。
-    age_errors : np.ndarray
-        年龄误差 (1σ) 数组 (n_depths,)。
-    n_members : int, optional
-        集合成员数，默认 500 (Kaufman 2020)。
-
-    Returns
-    -------
-    Dict
-        {'age_ensembles': np.ndarray (n_members, n_depths),
-         'n_members': int, 'method': 'BAM'}
+    The old name is retained so existing notebooks do not break, but it does
+    not claim to fit the Banded Age Model (BAM).
     """
-    n_depths = len(depths)
-    ensembles = np.zeros((n_members, n_depths))
-
-    for i in range(n_members):
-        perturbed = ages + np.random.normal(0, age_errors)
-        # 确保地层单调性：年龄随深度递增
-        for j in range(1, n_depths):
-            if perturbed[j] <= perturbed[j - 1]:
-                perturbed[j] = perturbed[j - 1] + abs(age_errors[j])
-        ensembles[i] = perturbed
-
-    return {
-        'age_ensembles': ensembles,
-        'n_members': n_members,
-        'method': 'BAM',
-    }
+    warnings.warn(
+        'bam_age_ensemble 已改为 age_ensemble_from_errors；输出不是 BAM 年龄模型。',
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return age_ensemble_from_errors(
+        depths, ages, age_errors, n_members=n_members, random_state=random_state
+    )
 
 
 def consume_bacon_ages(bacon_output_path: str) -> Dict:
@@ -117,7 +155,7 @@ def consume_bacon_ages(bacon_output_path: str) -> Dict:
          'depths': np.ndarray, 'n_members': int, 'method': 'Bacon'}
     """
     try:
-        df = pd.read_csv(bacon_output_path, delim_whitespace=True)
+        df = pd.read_csv(bacon_output_path, sep=r'\s+')
     except Exception:
         df = pd.read_csv(bacon_output_path)
 
@@ -129,6 +167,7 @@ def consume_bacon_ages(bacon_output_path: str) -> Dict:
         age_ensembles = df.values.T
         depths = np.arange(df.shape[0])
 
+    age_ensembles = validate_age_ensembles(age_ensembles, age_ensembles.shape[1])
     return {
         'age_ensembles': age_ensembles,
         'depths': depths,
@@ -141,6 +180,9 @@ def zscore_standardize(
     data: Union[np.ndarray, pd.DataFrame],
     baseline_period: Optional[Tuple[float, float]] = None,
     group_col: Optional[str] = None,
+    ages: Optional[np.ndarray] = None,
+    value_columns: Optional[List[str]] = None,
+    ddof: int = 0,
 ) -> Dict:
     """Izdebski 2022, Power 2008：z-score 标准化。
 
@@ -154,42 +196,76 @@ def zscore_standardize(
     data : np.ndarray or pd.DataFrame
         代理值数组或 DataFrame。若 DataFrame 且 group_col 指定，按分组分别标准化。
     baseline_period : tuple, optional
-        基准时段 (start, end)。默认整个研究时段 (Izdebski 2022)。
+        基准时段 (start, end)。指定时必须同时提供 ages。
     group_col : str, optional
         DataFrame 中的分组列名（如分类群名、岩芯 ID 或代理类型）。
+    ages : np.ndarray, optional
+        与数组行对应的年龄，用于 baseline_period 的筛选。
+    value_columns : list, optional
+        DataFrame 中需要标准化的代理列。默认使用数值列，但排除 group_col。
+    ddof : int, optional
+        标准差自由度，默认 0；跨模块应保持一致。
 
     Returns
     -------
     Dict
         {'z_scores': same type as input, 'means': dict, 'stds': dict, 'baseline': str}
     """
-    if isinstance(data, pd.DataFrame) and group_col is not None:
-        groups = data[group_col].unique()
+    if baseline_period is not None:
+        if ages is None:
+            raise ValueError('使用 baseline_period 时必须提供 ages。')
+        age_arr = as_float_array(ages, 'ages', ndim=1, allow_nan=False)
+        if len(age_arr) != len(data):
+            raise ValueError('ages 必须与 data 的行数一致。')
+        baseline_mask = (age_arr >= baseline_period[0]) & (age_arr <= baseline_period[1])
+        if not np.any(baseline_mask):
+            raise ValueError('baseline_period 内没有有效样本。')
+    else:
+        baseline_mask = np.ones(len(data), dtype=bool)
+
+    if isinstance(data, pd.DataFrame):
+        columns = list(value_columns) if value_columns is not None else data.select_dtypes(include=[np.number]).columns.tolist()
+        if group_col in columns:
+            columns.remove(group_col)
+        missing = [c for c in columns if c not in data.columns]
+        if missing:
+            raise ValueError(f'value_columns 不存在：{missing}')
+        if not columns:
+            raise ValueError('没有可标准化的数值代理列。')
+
+        groups = data[group_col].dropna().unique() if group_col is not None else [None]
         z_data = data.copy()
         means, stds = {}, {}
         for g in groups:
-            mask = data[group_col] == g
-            values = data.loc[mask].select_dtypes(include=[np.number])
-            mu = values.mean()
-            sigma = values.std()
-            z_data.loc[mask, values.columns] = (values - mu) / sigma
-            means[g] = mu.to_dict()
-            stds[g] = sigma.to_dict()
+            group_mask = (data[group_col] == g) if group_col is not None else np.ones(len(data), dtype=bool)
+            fit_mask = group_mask & baseline_mask
+            values = data.loc[fit_mask, columns]
+            mu = values.mean(axis=0)
+            sigma = values.std(axis=0, ddof=ddof).replace(0, np.nan)
+            z_data.loc[group_mask, columns] = (data.loc[group_mask, columns] - mu) / sigma
+            key = g if g is not None else 'all'
+            means[key] = mu.to_dict()
+            stds[key] = sigma.to_dict()
         baseline = 'full_period' if baseline_period is None else str(baseline_period)
-        return {'z_scores': z_data, 'means': means, 'stds': stds, 'baseline': baseline}
+        return {
+            'z_scores': z_data,
+            'means': means,
+            'stds': stds,
+            'baseline': baseline,
+            'value_columns': columns,
+            'ddof': ddof,
+        }
 
-    arr = np.asarray(data, dtype=float)
-    if baseline_period is not None:
-        mask = (arr >= baseline_period[0]) & (arr <= baseline_period[1])
-        mu = np.nanmean(arr[mask])
-        sigma = np.nanstd(arr[mask])
-    else:
-        mu = np.nanmean(arr)
-        sigma = np.nanstd(arr)
-
+    arr = as_float_array(data, 'data', ndim=None)
+    if baseline_period is not None and arr.ndim != 1:
+        raise ValueError('ndarray 的 baseline_period 目前要求 data 为一维序列。')
+    fit_values = arr[baseline_mask] if arr.ndim == 1 else arr
+    mu = np.nanmean(fit_values, axis=0)
+    sigma = np.nanstd(fit_values, axis=0, ddof=ddof)
+    sigma = np.where(sigma == 0, np.nan, sigma)
     z = (arr - mu) / sigma
     baseline = 'full_period' if baseline_period is None else str(baseline_period)
-    return {'z_scores': z, 'mean': mu, 'std': sigma, 'baseline': baseline}
+    return {'z_scores': z, 'mean': mu, 'std': sigma, 'baseline': baseline, 'ddof': ddof}
 
 
 def resample_to_grid(
@@ -221,29 +297,49 @@ def resample_to_grid(
         {'resampled': np.ndarray (n_bins,) or (n_members, n_bins, n_vars),
          'time_grid': np.ndarray, 'n_bins': int}
     """
-    if values.ndim == 1:
-        values = values[:, np.newaxis]
+    age_arr = as_float_array(ages, 'ages', ndim=1, allow_nan=False, min_size=2)
+    value_arr = as_float_array(values, 'values', ndim=None)
+    if value_arr.ndim == 1:
+        value_arr = value_arr[:, np.newaxis]
+    if value_arr.ndim != 2:
+        raise ValueError('values 必须是一维或二维数组。')
+    validate_same_length(('ages', age_arr), ('values', value_arr))
+    grid = as_float_array(time_grid, 'time_grid', ndim=1, allow_nan=False)
 
     if age_ensembles is not None:
+        age_ensembles = validate_age_ensembles(age_ensembles, len(age_arr))
         n_members = age_ensembles.shape[0]
-        n_vars = values.shape[1]
-        resampled = np.zeros((n_members, len(time_grid), n_vars))
+        n_vars = value_arr.shape[1]
+        resampled = np.full((n_members, len(grid), n_vars), np.nan)
         for m in range(n_members):
             for t in range(n_vars):
-                resampled[m, :, t] = np.interp(
-                    time_grid, age_ensembles[m], values[:, t]
+                resampled[m, :, t] = interpolate_no_extrapolation(
+                    age_ensembles[m], value_arr[:, t], grid,
+                    name=f'age_member_{m}',
                 )
         if n_vars == 1:
             resampled = resampled[:, :, 0]
-        return {'resampled': resampled, 'time_grid': time_grid, 'n_bins': len(time_grid)}
+        return {
+            'resampled': resampled,
+            'time_grid': grid,
+            'n_bins': len(grid),
+            'extrapolation': 'nan',
+        }
 
-    n_vars = values.shape[1]
-    resampled = np.zeros((len(time_grid), n_vars))
+    n_vars = value_arr.shape[1]
+    resampled = np.full((len(grid), n_vars), np.nan)
     for t in range(n_vars):
-        resampled[:, t] = np.interp(time_grid, ages, values[:, t])
+        resampled[:, t] = interpolate_no_extrapolation(
+            age_arr, value_arr[:, t], grid, name=f'variable_{t}'
+        )
     if n_vars == 1:
         resampled = resampled[:, 0]
-    return {'resampled': resampled, 'time_grid': time_grid, 'n_bins': len(time_grid)}
+    return {
+        'resampled': resampled,
+        'time_grid': grid,
+        'n_bins': len(grid),
+        'extrapolation': 'nan',
+    }
 
 
 def spatial_clustering(
@@ -266,7 +362,7 @@ def spatial_clustering(
         - 'auto' (默认)：根据站点密度自动选择。站点密集且分布不均时用 'cluster'，
           站点稀疏或均匀分布时用 'grid'。
         - 'cluster'：基于距离的地理聚类（Izdebski 2022）。
-        - 'grid'：等面积经纬度网格化（Kaufman 2020）。
+        - 'grid'：经纬度网格化；不等同于等面积投影。
         - 'karst'：'cluster' 的别名，保留向后兼容。
     radius_km : float, optional
         聚类半径 (km)，默认 200 (Izdebski 2022)。
@@ -288,6 +384,15 @@ def spatial_clustering(
         a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
         return 6371 * 2 * asin(sqrt(a))
 
+    if not isinstance(site_coords, pd.DataFrame) or not {'lat', 'lon'}.issubset(site_coords.columns):
+        raise ValueError("site_coords 必须是包含 'lat' 和 'lon' 列的 DataFrame。")
+    if site_coords.empty:
+        raise ValueError('site_coords 不能为空。')
+    if not np.isfinite(site_coords[['lat', 'lon']].to_numpy(dtype=float)).all():
+        raise ValueError('site_coords 不能包含 NaN 或无穷值。')
+    if radius_km <= 0 or grid_resolution <= 0:
+        raise ValueError('radius_km 和 grid_resolution 必须为正值。')
+
     # 'karst' 向后兼容
     if method == 'karst':
         method = 'cluster'
@@ -306,13 +411,13 @@ def spatial_clustering(
     n = len(sites)
 
     if method == 'grid':
-        # 等面积网格化
+        # 简单经纬度网格化；正式面积比较应使用等面积投影。
         clusters = {}
         for site in sites:
             lat = site_coords.loc[site, 'lat']
             lon = site_coords.loc[site, 'lon']
-            grid_lat = round(lat / grid_resolution) * grid_resolution
-            grid_lon = round(lon / grid_resolution) * grid_resolution
+            grid_lat = np.floor(lat / grid_resolution) * grid_resolution
+            grid_lon = np.floor(lon / grid_resolution) * grid_resolution
             key = f'{grid_lat}_{grid_lon}'
             clusters.setdefault(key, []).append(site)
         # 将 key 转为序号
@@ -323,27 +428,36 @@ def spatial_clustering(
         }
 
     # cluster 模式：基于距离的地理聚类
-    assigned = [False] * n
-    clusters = {}
-    cluster_id = 0
-
-    for i in range(n):
-        if assigned[i]:
-            continue
-        cluster_id += 1
-        clusters[cluster_id] = [sites[i]]
-        assigned[i] = True
-        lat_i = site_coords.loc[sites[i], 'lat']
-        lon_i = site_coords.loc[sites[i], 'lon']
+    # Connected components make clustering transitive and independent of row order.
+    adjacency = {site: set() for site in sites}
+    for i, site_i in enumerate(sites):
         for j in range(i + 1, n):
-            if assigned[j]:
-                continue
-            lat_j = site_coords.loc[sites[j], 'lat']
-            lon_j = site_coords.loc[sites[j], 'lon']
-            dist = haversine(lat_i, lon_i, lat_j, lon_j)
+            site_j = sites[j]
+            dist = haversine(
+                site_coords.loc[site_i, 'lat'], site_coords.loc[site_i, 'lon'],
+                site_coords.loc[site_j, 'lat'], site_coords.loc[site_j, 'lon'],
+            )
             if dist <= radius_km:
-                clusters[cluster_id].append(sites[j])
-                assigned[j] = True
+                adjacency[site_i].add(site_j)
+                adjacency[site_j].add(site_i)
+
+    clusters = {}
+    unvisited = set(sites)
+    cluster_id = 0
+    while unvisited:
+        cluster_id += 1
+        seed = next(iter(unvisited))
+        stack = [seed]
+        component = []
+        unvisited.remove(seed)
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if neighbor in unvisited:
+                    unvisited.remove(neighbor)
+                    stack.append(neighbor)
+        clusters[cluster_id] = component
 
     return {
         'clusters': clusters, 'method': 'cluster',

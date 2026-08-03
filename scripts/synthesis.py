@@ -14,7 +14,26 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from scipy.stats import bootstrap
-from statsmodels.nonparametric.lowess import lowess
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+try:
+    from ._utils import (
+        as_float_array,
+        get_rng,
+        interpolate_no_extrapolation,
+        normalize_weights,
+        weighted_nanmean,
+        validate_age_ensembles,
+    )
+except ImportError:  # pragma: no cover - supports direct script imports
+    from _utils import (
+        as_float_array,
+        get_rng,
+        interpolate_no_extrapolation,
+        normalize_weights,
+        weighted_nanmean,
+        validate_age_ensembles,
+    )
 
 
 def scc_composite(
@@ -37,16 +56,14 @@ def scc_composite(
     Dict
         {'composite': np.ndarray (n_timebins,), 'n_sites': int, 'method': 'SCC'}
     """
-    if weights is None:
-        weights = np.ones(calibrated_values.shape[0]) / calibrated_values.shape[0]
-    else:
-        weights = weights / weights.sum()
-
-    composite = np.nansum(calibrated_values * weights[:, np.newaxis], axis=0)
+    values = as_float_array(calibrated_values, 'calibrated_values', ndim=2)
+    weights = normalize_weights(weights, values.shape[0])
+    composite = weighted_nanmean(values, weights)
     return {
         'composite': composite,
-        'n_sites': calibrated_values.shape[0],
+        'n_sites': values.shape[0],
         'method': 'SCC',
+        'weights': weights,
     }
 
 
@@ -73,22 +90,20 @@ def dcc_composite(
     Dict
         {'composite': np.ndarray, 'n_sites': int, 'method': 'DCC'}
     """
-    n_sites, n_bins = calibrated_values.shape
-    if weights is None:
-        weights = np.ones(n_sites) / n_sites
-    else:
-        weights = weights / weights.sum()
-
-    calibrated = np.zeros_like(calibrated_values)
+    values = as_float_array(calibrated_values, 'calibrated_values', ndim=2)
+    n_sites, n_bins = values.shape
+    weights = normalize_weights(weights, n_sites)
+    calibrated = np.full_like(values, np.nan)
     for t in range(n_bins):
         for s in range(n_sites):
-            calibrated[s, t] = time_varying_calib_func(calibrated_values[s, t], t)
+            calibrated[s, t] = time_varying_calib_func(values[s, t], t)
 
-    composite = np.nansum(calibrated * weights[:, np.newaxis], axis=0)
+    composite = weighted_nanmean(calibrated, weights)
     return {
         'composite': composite,
         'n_sites': n_sites,
         'method': 'DCC',
+        'weights': weights,
     }
 
 
@@ -115,7 +130,10 @@ def cps_composite(
     Dict
         {'composite': np.ndarray, 'baseline_mean': float, 'baseline_std': float, 'method': 'CPS'}
     """
-    composite_z = np.nanmean(z_scores, axis=0)
+    values = as_float_array(z_scores, 'z_scores', ndim=2)
+    if not np.isfinite(baseline_std) or baseline_std < 0:
+        raise ValueError('baseline_std 必须为非负有限值。')
+    composite_z = np.nanmean(values, axis=0)
     composite = composite_z * baseline_std + baseline_mean
     return {
         'composite': composite,
@@ -146,18 +164,23 @@ def pai_composite(
     Dict
         {'composite': np.ndarray (n_timebins,), 'agreement_ratio': np.ndarray, 'method': 'PAI'}
     """
-    n_sites, n_bins = z_scores.shape
-    # 相对于第一时点的变化方向
-    diff = np.diff(z_scores, axis=1, prepend=z_scores[:, [0]])
-
-    if direction == 'positive':
-        signs = (diff > 0).astype(float)
-    else:
-        signs = (diff < 0).astype(float)
-
-    # 方向一致性比例
-    agreement_ratio = np.nanmean(signs, axis=0)
-    # PAI 指数 = 2 * agreement - 1，范围 [-1, 1]
+    values = as_float_array(z_scores, 'z_scores', ndim=2)
+    if direction not in {'positive', 'negative'}:
+        raise ValueError("direction 须为 'positive' 或 'negative'。")
+    n_sites, n_bins = values.shape
+    diff = np.full_like(values, np.nan)
+    diff[:, 0] = 0.0
+    if n_bins > 1:
+        diff[:, 1:] = np.diff(values, axis=1)
+    valid = np.isfinite(diff)
+    signs = np.where(direction == 'positive', diff > 0, diff < 0)
+    agreement_ratio = np.divide(
+        np.sum(np.where(valid, signs, False), axis=0),
+        np.sum(valid, axis=0),
+        out=np.full(n_bins, np.nan, dtype=float),
+        where=np.sum(valid, axis=0) > 0,
+    )
+    # PAI 指数 = 2 * agreement - 1；无有效样本的位置保持 NaN
     composite = 2 * agreement_ratio - 1
 
     return {
@@ -189,16 +212,34 @@ def gam_composite(
     Dict
         {'gam': LinearGAM, 'predicted': np.ndarray, 'n_splines': int, 'method': 'GAM'}
     """
-    from pygam import LinearGAM, s
+    time_arr = as_float_array(time, 'time', ndim=1, allow_nan=False, min_size=4)
+    values_arr = as_float_array(values, 'values', ndim=1)
+    if len(time_arr) != len(values_arr):
+        raise ValueError('time 和 values 长度必须一致。')
+    valid = np.isfinite(values_arr)
+    if valid.sum() < max(4, n_splines):
+        raise ValueError('GAM 有效样本数不足以支持当前 n_splines。')
+    if n_splines < 4:
+        raise ValueError('n_splines 至少为 4。')
+    try:
+        from pygam import LinearGAM, s
+    except ImportError as exc:
+        raise ImportError(
+            'gam_composite 需要可选依赖 PyGAM；请安装 requirements-optional.txt，'
+            '或选择 scc/cps/weighted_mean。'
+        ) from exc
 
-    gam = LinearGAM(s(0, n_splines=n_splines)).fit(time, values)
-    predicted = gam.predict(time)
+    gam = LinearGAM(s(0, n_splines=n_splines)).fit(
+        time_arr[valid, None], values_arr[valid]
+    )
+    predicted = gam.predict(time_arr[:, None])
 
     return {
         'gam': gam,
         'predicted': predicted,
         'n_splines': n_splines,
         'method': 'GAM',
+        'n_valid': int(valid.sum()),
     }
 
 
@@ -208,6 +249,7 @@ def monte_carlo_ensemble(
     proxy_errors: np.ndarray,
     composite_func: Callable,
     n_members: int = 500,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """Kaufman 2020 500 成员集合策略：传播年龄+校准+采样三层不确定性。
 
@@ -218,7 +260,7 @@ def monte_carlo_ensemble(
     records : np.ndarray
         各点位代理值 (n_sites, n_depths)。
     age_ensembles : np.ndarray
-        BAM/Bacon 年龄集合 (n_ensemble_members, n_depths)。
+        外部年龄模型产生的年龄集合 (n_ensemble_members, n_depths)。
     proxy_errors : np.ndarray
         各点位代理校准误差 (n_sites,)。
     composite_func : callable
@@ -231,25 +273,44 @@ def monte_carlo_ensemble(
     Dict
         {'ensembles': np.ndarray (n_members, n_timebins), 'n_members': int, 'method': 'Monte Carlo'}
     """
+    values = as_float_array(records, 'records', ndim=2)
+    errors = as_float_array(proxy_errors, 'proxy_errors', ndim=1, allow_nan=False)
+    if len(errors) != values.shape[0]:
+        raise ValueError('proxy_errors 必须按站点提供。')
+    if np.any(errors < 0):
+        raise ValueError('proxy_errors 必须非负。')
+    age_arr = as_float_array(age_ensembles, 'age_ensembles', ndim=None, allow_nan=False)
+    if age_arr.ndim not in {2, 3}:
+        raise ValueError('age_ensembles 必须为 (members, samples) 或 (sites, members, samples)。')
+    if age_arr.ndim == 2:
+        validate_age_ensembles(age_arr, values.shape[1])
+        n_pool = age_arr.shape[0]
+    else:
+        if age_arr.shape[0] != values.shape[0] or age_arr.shape[2] != values.shape[1]:
+            raise ValueError('逐站点 age_ensembles 必须为 (sites, members, samples)。')
+        n_pool = age_arr.shape[1]
+    if n_members < 1:
+        raise ValueError('n_members 至少为 1。')
+    rng = get_rng(random_state)
     ensembles = []
-    n_ensemble_pool = age_ensembles.shape[0]
 
     for i in range(n_members):
-        # 整体采样年龄成员（保持地层单调性）
-        ages = age_ensembles[i % n_ensemble_pool]
+        if age_arr.ndim == 2:
+            ages = age_arr[i % n_pool]
+        else:
+            ages = age_arr[:, i % n_pool, :]
         # 采样代理校准不确定性
-        noise = np.random.normal(
-            0, proxy_errors[:, np.newaxis], size=records.shape
-        )
-        values = records + noise
+        noise = rng.normal(0, errors[:, np.newaxis], size=values.shape)
+        noisy_values = values + noise
         # 执行合成
-        composite = composite_func(ages, values)
+        composite = composite_func(ages, noisy_values)
         ensembles.append(composite)
 
     return {
         'ensembles': np.array(ensembles),
         'n_members': n_members,
         'method': 'Monte Carlo',
+        'random_state': random_state if isinstance(random_state, int) else None,
     }
 
 
@@ -271,7 +332,17 @@ def uncertainty_band(
     Dict
         {'lower': float, 'median': np.ndarray, 'upper': np.ndarray, 'percentiles': tuple}
     """
-    bands = np.percentile(ensembles, percentiles, axis=0)
+    values = as_float_array(ensembles, 'ensembles', ndim=2, allow_nan=True, min_size=2)
+    if len(percentiles) != 3 or tuple(sorted(percentiles)) != tuple(percentiles):
+        raise ValueError('percentiles 必须是三个按升序排列的数值。')
+    if any(p < 0 or p > 100 for p in percentiles):
+        raise ValueError('percentiles 必须位于 0 到 100 之间。')
+    bands = np.full((len(percentiles), values.shape[1]), np.nan)
+    for j in range(values.shape[1]):
+        column = values[:, j]
+        finite = column[np.isfinite(column)]
+        if len(finite):
+            bands[:, j] = np.percentile(finite, percentiles)
     return {
         'lower': bands[0],
         'median': bands[1],
@@ -305,7 +376,16 @@ def loess_trend(
     Dict
         {'smoothed': np.ndarray (n_points, 2), 'frac': float, 'method': 'LOESS'}
     """
-    smoothed = lowess(values, time, frac=frac, return_sorted=True)
+    time_arr = as_float_array(time, 'time', ndim=1, allow_nan=False)
+    values_arr = as_float_array(values, 'values', ndim=1)
+    if len(time_arr) != len(values_arr):
+        raise ValueError('time 和 values 长度必须一致。')
+    valid = np.isfinite(values_arr)
+    if valid.sum() < 3:
+        raise ValueError('LOESS 至少需要三个有限观测。')
+    if not 0 < frac <= 1:
+        raise ValueError('frac 必须位于 (0, 1]。')
+    smoothed = lowess(values_arr[valid], time_arr[valid], frac=frac, return_sorted=True)
     return {
         'smoothed': smoothed,
         'frac': frac,
@@ -337,28 +417,34 @@ def resample_and_composite(
     np.ndarray
         合成结果 (n_bins,)。
     """
-    n_sites = values.shape[0]
-    if weights is None:
-        weights = np.ones(n_sites) / n_sites
-    else:
-        weights = weights / weights.sum()
+    values_arr = as_float_array(values, 'values', ndim=2)
+    ages_arr = as_float_array(ages, 'ages', ndim=None, allow_nan=False)
+    grid = as_float_array(time_grid, 'time_grid', ndim=1, allow_nan=False)
+    n_sites = values_arr.shape[0]
+    weights = normalize_weights(weights, n_sites)
+    if ages_arr.ndim == 1:
+        ages_arr = np.broadcast_to(ages_arr, (n_sites, ages_arr.shape[0]))
+    if ages_arr.shape != values_arr.shape:
+        raise ValueError('逐站点 ages 必须与 values 形状一致。')
 
-    resampled = np.zeros((n_sites, len(time_grid)))
+    resampled = np.full((n_sites, len(grid)), np.nan)
     for s in range(n_sites):
-        resampled[s] = np.interp(time_grid, ages, values[s])
-
-    return np.nansum(resampled * weights[:, np.newaxis], axis=0)
+        resampled[s] = interpolate_no_extrapolation(
+            ages_arr[s], values_arr[s], grid, name=f'site_{s}'
+        )
+    return weighted_nanmean(resampled, weights)
 
 
 def multi_method_cross_validation(
     records: np.ndarray,
     age_ensembles: np.ndarray,
     proxy_errors: np.ndarray,
-    methods: List[str] = ['scc', 'gam', 'cps'],
+    methods: Optional[List[str]] = None,
     n_members: int = 500,
     time_grid: Optional[np.ndarray] = None,
     baseline_mean: float = 0.0,
     baseline_std: float = 1.0,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """Kaufman 2020 多方法集合策略：同时运行多种合成方法比较结果一致性。
 
@@ -384,38 +470,44 @@ def multi_method_cross_validation(
     Dict
         {'results': dict (method -> ensemble array), 'consistency': float, 'methods': list}
     """
+    records_arr = as_float_array(records, 'records', ndim=2)
+    age_arr = as_float_array(age_ensembles, 'age_ensembles', ndim=2, allow_nan=False)
+    if age_arr.shape[1] != records_arr.shape[1]:
+        raise ValueError('age_ensembles 与 records 的样本维度必须一致。')
+    errors = as_float_array(proxy_errors, 'proxy_errors', ndim=1, allow_nan=False)
+    if len(errors) != records_arr.shape[0]:
+        raise ValueError('proxy_errors 必须按站点提供。')
+    if methods is None:
+        methods = ['scc', 'gam', 'cps']
+    allowed = {'scc', 'gam', 'cps'}
+    unknown = set(methods) - allowed
+    if unknown:
+        raise ValueError(f'不支持的 synthesis method: {sorted(unknown)}')
     if time_grid is None:
-        time_grid = np.linspace(
-            age_ensembles.min(), age_ensembles.max(), 200
-        )
+        time_grid = np.linspace(age_arr.min(), age_arr.max(), 200)
+    time_grid = as_float_array(time_grid, 'time_grid', ndim=1, allow_nan=False)
 
     results = {}
 
     for method in methods:
-        if method == 'scc':
-            def comp_func(ages, vals):
-                resampled = np.zeros((vals.shape[0], len(time_grid)))
-                for s in range(vals.shape[0]):
-                    resampled[s] = np.interp(time_grid, ages, vals[s])
+        def comp_func(ages, vals, _method=method):
+            ages_for_sites = ages if np.asarray(ages).ndim == 2 else np.asarray(ages)
+            resampled = np.full((vals.shape[0], len(time_grid)), np.nan)
+            for s in range(vals.shape[0]):
+                age_s = ages_for_sites[s] if np.asarray(ages_for_sites).ndim == 2 else ages_for_sites
+                resampled[s] = interpolate_no_extrapolation(
+                    age_s, vals[s], time_grid, name=f'site_{s}'
+                )
+            if _method == 'scc':
                 return scc_composite(resampled)['composite']
-        elif method == 'gam':
-            def comp_func(ages, vals):
-                resampled = np.zeros((vals.shape[0], len(time_grid)))
-                for s in range(vals.shape[0]):
-                    resampled[s] = np.interp(time_grid, ages, vals[s])
-                composite = np.nanmean(resampled, axis=0)
-                return composite
-        elif method == 'cps':
-            def comp_func(ages, vals):
-                resampled = np.zeros((vals.shape[0], len(time_grid)))
-                for s in range(vals.shape[0]):
-                    resampled[s] = np.interp(time_grid, ages, vals[s])
+            if _method == 'cps':
                 return cps_composite(resampled, baseline_mean, baseline_std)['composite']
-        else:
-            continue
+            mean_curve = np.nanmean(resampled, axis=0)
+            return gam_composite(time_grid, mean_curve)['predicted']
 
         ens = monte_carlo_ensemble(
-            records, age_ensembles, proxy_errors, comp_func, n_members
+            records_arr, age_arr, errors, comp_func, n_members,
+            random_state=random_state,
         )
         results[method] = ens['ensembles']
 
@@ -432,6 +524,7 @@ def multi_method_cross_validation(
     return {
         'results': results,
         'consistency': consistency,
-        'methods': methods,
+        'methods': list(methods),
         'n_members': n_members,
+        'random_state': random_state if isinstance(random_state, int) else None,
     }

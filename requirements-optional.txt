@@ -1,0 +1,18 @@
+# Optional Python methods
+pygam>=0.8
+scikit-learn>=1.0
+libpysal>=4.6
+esda>=2.4
+
+# Optional Bayesian/reporting extensions
+# pymc>=5.0
+# arviz>=1.0
+
+# Optional geospatial and paleo-data extensions
+# cartopy>=0.21
+# pylipd>=0.2
+# pyleoclim>=0.13
+
+# Optional R backend (install R separately, then in R run:
+# install.packages("metafor")
+# )

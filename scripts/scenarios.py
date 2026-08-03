@@ -22,24 +22,48 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(__file__))
-from preprocessing import (
-    zscore_standardize, resample_to_grid, spatial_clustering,
-    bam_age_ensemble, harmonize_names,
-)
-from synthesis import (
-    scc_composite, gam_composite, monte_carlo_ensemble,
-    uncertainty_band, loess_trend, multi_method_cross_validation,
-)
-from effect_size import (
-    log_response_ratio, effect_size_bca, rmsep, loocv,
-    quasi_experiment_effect_size,
-)
-from continuous_proxy import (
-    standardize_continuous_proxy, calibrate_continuous_proxy,
-    composite_continuous_proxy, propagate_continuous_uncertainty,
-    cross_validate_calibration, proxy_comparison,
-)
+try:
+    from .preprocessing import (
+        zscore_standardize, resample_to_grid, spatial_clustering,
+        age_ensemble_from_errors, bam_age_ensemble, harmonize_names,
+    )
+    from .synthesis import (
+        scc_composite, cps_composite, gam_composite, monte_carlo_ensemble,
+        uncertainty_band, loess_trend, multi_method_cross_validation,
+    )
+    from .effect_size import (
+        log_response_ratio, hedges_d, effect_size_bca, rmsep, loocv,
+        quasi_experiment_effect_size,
+    )
+    from .continuous_proxy import (
+        standardize_continuous_proxy, calibrate_continuous_proxy,
+        composite_continuous_proxy, propagate_continuous_uncertainty,
+        cross_validate_calibration, proxy_comparison,
+    )
+except ImportError:  # pragma: no cover - supports direct script imports
+    sys.path.insert(0, os.path.dirname(__file__))
+    from preprocessing import (
+        zscore_standardize, resample_to_grid, spatial_clustering,
+        age_ensemble_from_errors, bam_age_ensemble, harmonize_names,
+    )
+    from synthesis import (
+        scc_composite, cps_composite, gam_composite, monte_carlo_ensemble,
+        uncertainty_band, loess_trend, multi_method_cross_validation,
+    )
+    from effect_size import (
+        log_response_ratio, hedges_d, effect_size_bca, rmsep, loocv,
+        quasi_experiment_effect_size,
+    )
+    from continuous_proxy import (
+        standardize_continuous_proxy, calibrate_continuous_proxy,
+        composite_continuous_proxy, propagate_continuous_uncertainty,
+        cross_validate_calibration, proxy_comparison,
+    )
+
+try:
+    from ._utils import as_float_array, interpolate_no_extrapolation, weighted_nanmean
+except ImportError:  # pragma: no cover
+    from _utils import as_float_array, interpolate_no_extrapolation, weighted_nanmean
 
 
 def select_scenario(
@@ -73,8 +97,8 @@ def select_scenario(
             'description': '时序叠加结构：多站点时间序列合成',
         },
         'before_after': {
-            'scenario': 3, 'name': '事件归因分析',
-            'description': '准实验结构：事件前后指标变化',
+            'scenario': 3, 'name': '事件前后变化比较',
+            'description': '准实验结构：事件前后指标变化；默认解释为关联而非因果',
         },
     }
 
@@ -105,6 +129,8 @@ def scenario1_proxy_validation(
     calibration_x: Optional[np.ndarray] = None,
     calibration_y: Optional[np.ndarray] = None,
     n_boot: int = 10000,
+    effect_type: str = 'auto',
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """场景一：代用指标有效性评估（分类群+连续值双通道）。
 
@@ -132,16 +158,37 @@ def scenario1_proxy_validation(
     Dict
         {'effect_size': dict, 'rmsep': float, 'ci': tuple, 'calibration': dict or None}
     """
-    # 效应量计算（通用）
-    ratios = log_response_ratio(proxy_values, observed_values)
-    ci = effect_size_bca(proxy_values, observed_values, n_boot=n_boot)
+    proxy_arr = as_float_array(proxy_values, 'proxy_values', ndim=1)
+    observed_arr = as_float_array(observed_values, 'observed_values', ndim=1)
+    if len(proxy_arr) != len(observed_arr):
+        raise ValueError('proxy_values 与 observed_values 长度必须一致。')
+    valid = np.isfinite(proxy_arr) & np.isfinite(observed_arr)
+    proxy_arr, observed_arr = proxy_arr[valid], observed_arr[valid]
+    if len(proxy_arr) < 3:
+        raise ValueError('有效配对样本至少需要三个。')
+    if effect_type == 'auto':
+        effect_type = 'lnrr' if np.all(proxy_arr > 0) and np.all(observed_arr > 0) else 'd'
+    if effect_type == 'lnrr':
+        ratios = log_response_ratio(proxy_arr, observed_arr)
+        effect_summary = {'ratios': ratios, 'mean_ratio': float(np.mean(ratios))}
+    elif effect_type == 'd':
+        ratios = None
+        effect_summary = hedges_d(proxy_arr, observed_arr)
+    else:
+        raise ValueError("effect_type 须为 'auto'/'lnrr'/'d'。")
+    ci = effect_size_bca(
+        proxy_arr, observed_arr, effect_type=effect_type,
+        n_boot=n_boot, random_state=random_state,
+    )
     precision = rmsep(proxy_values, observed_values)
 
     result = {
-        'effect_size': {'ratios': ratios, 'mean_ratio': float(np.mean(ratios))},
+        'effect_size': effect_summary,
         'rmsep': precision,
         'ci': ci,
         'calibration': None,
+        'n_valid': int(len(proxy_arr)),
+        'effect_type': effect_type,
     }
 
     # 连续值通道：额外做校准验证
@@ -174,6 +221,8 @@ def scenario2_multi_site_synthesis(
     site_coords: Optional[pd.DataFrame] = None,
     spatial_method: str = 'auto',
     n_members: int = 500,
+    baseline_mean: float = 0.0,
+    baseline_std: float = 1.0,
 ) -> Dict:
     """场景二：多站点变化综合（分类群+连续值双通道）。
 
@@ -198,8 +247,10 @@ def scenario2_multi_site_synthesis(
         站点坐标（含 'lat', 'lon' 列），用于空间聚类。
     spatial_method : str, optional
         空间聚类方法，默认 'auto'（自动选择）。
-    n_members : int, optional
-        蒙特卡洛集合成员数，默认 500。
+        n_members : int, optional
+            蒙特卡洛集合成员数，默认 500。
+    baseline_mean, baseline_std : float, optional
+        CPS 的外部校准基准。未提供真实校准时不要把默认值解释为物理量。
 
     Returns
     -------
@@ -207,94 +258,85 @@ def scenario2_multi_site_synthesis(
         {'composite': np.ndarray, 'uncertainty_band': dict,
          'spatial_clusters': dict or None, 'method': str, 'n_sites': int}
     """
+    if not site_data:
+        raise ValueError('site_data 至少需要一个站点。')
+    if proxy_type not in {'taxa', 'continuous'}:
+        raise ValueError("proxy_type 须为 'taxa' 或 'continuous'。")
+    allowed_methods = {'scc', 'cps', 'gam', 'weighted_mean'}
+    if synthesis_method not in allowed_methods:
+        raise ValueError(f'不支持的 synthesis_method: {synthesis_method}')
+    grid = as_float_array(time_grid, 'time_grid', ndim=1, allow_nan=False)
     site_names = list(site_data.keys())
-    n_sites = len(site_data)
+    n_sites = len(site_names)
 
-    # 空间聚类（可选）
     clusters = None
     if site_coords is not None:
         clusters = spatial_clustering(site_coords, method=spatial_method)
 
-    if proxy_type == 'continuous':
-        # 连续值通道
-        site_values_list = [site_data[s]['values'] for s in site_names]
-        # 确保等长（重采样到 time_grid）
-        max_len = max(len(v) for v in site_values_list)
-        site_values = np.full((n_sites, max_len), np.nan)
-        for i, v in enumerate(site_values_list):
-            site_values[i, :len(v)] = v
-
-        site_ages = np.array([site_data[s]['ages'] for s in site_names])
-
-        age_ens = None
-        if 'age_ensembles' in site_data[site_names[0]]:
-            age_ens = site_data[site_names[0]]['age_ensembles']
-
-        proxy_errors = None
-        if 'proxy_error' in site_data[site_names[0]]:
-            proxy_errors = np.array([site_data[s].get('proxy_error', 0) for s in site_names])
-
-        result = composite_continuous_proxy(
-            site_values, site_ages, time_grid,
-            age_ensembles=age_ens, proxy_errors=proxy_errors,
-            n_members=n_members,
+    site_curves = []
+    site_weights = []
+    for site_name in site_names:
+        record = site_data[site_name]
+        values = as_float_array(record['values'], f'{site_name}.values', ndim=1)
+        ages = as_float_array(record['ages'], f'{site_name}.ages', ndim=1, allow_nan=False)
+        if len(values) != len(ages):
+            raise ValueError(f'{site_name} 的 values 与 ages 长度不一致。')
+        standardized = zscore_standardize(values)['z_scores'] if proxy_type == 'taxa' else values
+        result = resample_to_grid(
+            ages, standardized, grid,
+            age_ensembles=record.get('age_ensembles'),
         )
-        return {
-            'composite': result['composite'],
-            'uncertainty_band': result['uncertainty_band'],
-            'spatial_clusters': clusters,
-            'method': f'continuous_{synthesis_method}',
-            'n_sites': n_sites,
-        }
+        curves = result['resampled']
+        if curves.ndim == 1:
+            curves = curves[None, :]
+        site_curves.append(curves)
+        site_weights.append(record.get('weight', 1.0))
 
-    # 分类群通道
-    ensembles_list = []
-    for s in site_names:
-        ages = site_data[s]['ages']
-        values = site_data[s]['values']
-        age_ens = site_data[s].get('age_ensembles')
+    site_weights = np.asarray(site_weights, dtype=float)
+    if np.any(~np.isfinite(site_weights)) or np.any(site_weights < 0) or site_weights.sum() <= 0:
+        raise ValueError('站点 weight 必须为非负有限值且至少有一个正值。')
+    n_effective = max(curves.shape[0] for curves in site_curves)
+    if n_effective > 1:
+        n_effective = min(n_effective, n_members)
+    members = []
+    for member_index in range(n_effective):
+        stacked = np.vstack([
+            curves[member_index % curves.shape[0]] for curves in site_curves
+        ])
+        if synthesis_method == 'scc':
+            composite = scc_composite(stacked, site_weights)['composite']
+        elif synthesis_method == 'cps':
+            composite = cps_composite(
+                stacked, baseline_mean=baseline_mean, baseline_std=baseline_std
+            )['composite']
+        elif synthesis_method == 'gam':
+            mean_curve = weighted_nanmean(stacked, site_weights)
+            composite = gam_composite(grid, mean_curve)['predicted']
+        else:
+            composite = weighted_nanmean(stacked, site_weights)
+        members.append(composite)
 
-        z = zscore_standardize(values)
-        resampled = resample_to_grid(ages, z['z_scores'], time_grid, age_ensembles=age_ens)
-        ensembles_list.append(resampled['resampled'])
-
-    # 合成
-    if synthesis_method == 'gam':
-        # 用第一个成员拟合 GAM
-        first = ensembles_list[0]
-        if first.ndim == 2:
-            first = first[0]  # 取第一个年龄成员
-        gam_result = gam_composite(time_grid, first)
-        composite = gam_result['fitted_values'] if 'fitted_values' in gam_result else gam_result.get('composite', first)
-    elif synthesis_method == 'scc':
-        stacked = np.mean([e if e.ndim == 1 else e[0] for e in ensembles_list], axis=0)
-        composite = scc_composite(stacked, time_grid)['composite']
-    else:
-        stacked = np.mean([e if e.ndim == 1 else e[0] for e in ensembles_list], axis=0)
-        composite = stacked
-
-    # 蒙特卡洛集合
-    all_ensembles = []
-    for e in ensembles_list:
-        if e.ndim == 2:
-            all_ensembles.append(e)
-    if all_ensembles:
-        stacked_ens = np.mean(all_ensembles, axis=0)
-        band = uncertainty_band(stacked_ens)
-    else:
-        band = None
-
+    members = np.asarray(members)
+    band = uncertainty_band(members) if len(members) > 1 else None
+    composite = band['median'] if band is not None else members[0]
+    effective_site_count = np.sum(
+        np.isfinite(np.vstack([curves[0] for curves in site_curves])), axis=0
+    )
     return {
         'composite': composite,
+        'ensembles': members if len(members) > 1 else None,
         'uncertainty_band': band,
         'spatial_clusters': clusters,
-        'method': f'taxa_{synthesis_method}',
+        'method': f'{proxy_type}_{synthesis_method}',
         'n_sites': n_sites,
+        'n_members': int(len(members)),
+        'time_grid': grid,
+        'effective_site_count': effective_site_count,
     }
 
 
 # ---------------------------------------------------------------------------
-# 场景三：事件归因分析
+# 场景三：事件前后关联分析
 # ---------------------------------------------------------------------------
 
 def scenario3_human_attribution(
@@ -303,11 +345,12 @@ def scenario3_human_attribution(
     event_year: float,
     indicators: Optional[List[str]] = None,
     n_boot: int = 10000,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
-    """场景三：事件归因分析（准实验框架）。
+    """场景三：事件前后关联分析（准实验框架）。
 
-    数据结构特征：事件前后准实验比较。用 Bootstrap BCa 检验差异显著性，
-    多时间窗口稳健性验证，双指标系统交叉验证。
+    数据结构特征：事件前后准实验比较。用 Bootstrap BCa 检验差异区间，
+    多时间窗口稳健性验证，双指标系统交叉验证。默认不作因果归因。
 
     适用于任意代理类型（分类群百分比或连续值）和任意研究区域。
     常见应用：政策实施、战乱、气候事件、土地利用变化前后的指标变化。
@@ -349,10 +392,7 @@ def scenario3_human_attribution(
         # Bootstrap BCa 差异检验
         from scipy.stats import bootstrap
 
-        def mean_diff(data, axis=None):
-            a, b = data[0], data[1]
-            if axis is None:
-                return np.mean(a) - np.mean(b)
+        def mean_diff(a, b, axis=-1):
             return np.mean(a, axis=axis) - np.mean(b, axis=axis)
 
         try:
@@ -361,11 +401,15 @@ def scenario3_human_attribution(
                 statistic=mean_diff,
                 n_resamples=n_boot, method='BCa',
                 confidence_level=0.95,
+                random_state=random_state,
             )
             ci = (boot_result.confidence_interval.low,
                   boot_result.confidence_interval.high)
-        except Exception:
+        except Exception as exc:
             ci = (np.nan, np.nan)
+            bootstrap_error = str(exc)
+        else:
+            bootstrap_error = None
 
         # 效应量
         es = quasi_experiment_effect_size(before[:, i], after[:, i])
@@ -383,13 +427,14 @@ def scenario3_human_attribution(
             'ci': ci,
             'p_value': float(p_val),
             'effect_size': es,
+            'bootstrap_error': bootstrap_error,
         })
 
     return {
         'results': results,
         'n_indicators': n_indicators,
         'event_year': event_year,
-        'method': 'Bootstrap BCa + Mann-Whitney U',
+        'method': 'Bootstrap BCa + Mann-Whitney U (association check)',
         'n_boot': n_boot,
     }
 
@@ -435,12 +480,20 @@ def build_indicators(
     Dict
         {'indicators': pd.DataFrame, 'indicator_names': list, 'n_groups': int}
     """
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError('data 必须是 pandas DataFrame。')
     indicator_df = pd.DataFrame(index=data.index)
+    coverage = {}
 
     for name, taxa in taxon_groups.items():
         present = [t for t in taxa if t in data.columns]
+        coverage[name] = {
+            'requested': list(taxa),
+            'present': present,
+            'missing': [t for t in taxa if t not in data.columns],
+        }
         if not present:
-            indicator_df[name] = 0.0
+            indicator_df[name] = np.nan
             continue
         if agg_func == 'sum':
             indicator_df[name] = data[present].sum(axis=1)
@@ -454,6 +507,7 @@ def build_indicators(
         'indicator_names': list(taxon_groups.keys()),
         'n_groups': len(taxon_groups),
         'agg_func': agg_func,
+        'coverage': coverage,
     }
 
 
@@ -487,14 +541,18 @@ def before_after_test(
         {'before_mean': float, 'after_mean': float, 'difference': float,
          'ci': tuple, 'p_value': float, 'window': int}
     """
-    ages = np.asarray(ages)
-    values = np.asarray(time_series, dtype=float)
+    ages = as_float_array(ages, 'ages', ndim=1, allow_nan=False)
+    values = as_float_array(time_series, 'time_series', ndim=1)
+    if len(ages) != len(values):
+        raise ValueError('time_series 与 ages 长度必须一致。')
 
     before_mask = (ages >= event_year - window) & (ages < event_year)
     after_mask = (ages >= event_year) & (ages <= event_year + window)
 
     before = values[before_mask]
     after = values[after_mask]
+    before = before[np.isfinite(before)]
+    after = after[np.isfinite(after)]
 
     if len(before) == 0 or len(after) == 0:
         return {'error': f'窗口 {window} 年内数据不足（before={len(before)}, after={len(after)}）'}
@@ -574,8 +632,9 @@ def multi_window_robustness(
 
     if len(diffs) >= 2 and len(p_vals) >= 2:
         same_sign = all(d > 0 for d in diffs) or all(d < 0 for d in diffs)
-        all_significant = all(p < 0.05 for p in p_vals if not np.isnan(p))
-        robust = same_sign and all_significant
+        finite_p = [p for p in p_vals if np.isfinite(p)]
+        all_significant = bool(finite_p) and all(p < 0.05 for p in finite_p)
+        robust = same_sign and all_significant and len(finite_p) == len(diffs)
     else:
         robust = None
 
@@ -584,4 +643,6 @@ def multi_window_robustness(
         'robust': robust,
         'windows': windows,
         'n_windows': len(windows),
+        'valid_windows': len(diffs),
+        'note': '窗口重叠且共享时间序列时，稳健性结果不等同于独立重复检验。',
     }

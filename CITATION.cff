@@ -4,9 +4,9 @@ message: "如果您在研究中使用此工具包，请按以下方式引用。"
 type: software
 authors:
   - given-names: "paleoecology-research"
-title-alternative: "面向古生态学时序数据的混合方法 Meta 分析工具（BAM 年龄集合 + SCC/DCC/CPS/PAI/GAM 合成 + Bootstrap BCa + 效应量 + 连续值代理校准 + R metafor 桥接）"
-version: "2.1.0"
-date-released: "2026-07-19"
+title-alternative: "面向多站点古生态学与古气候代理记录的通用可复现合成工作流"
+version: "2.2.0"
+date-released: "2026-08-03"
 license: MIT
 repository-code: "https://github.com/1itti1/paleoecology-meta-analysis-skill"
 keywords:
@@ -14,7 +14,7 @@ keywords:
   - paleoclimate
   - meta-analysis
   - multi-proxy
-  - BAM
+  - chronology-uncertainty
   - bootstrap
   - effect-size
   - continuous-proxy
@@ -26,6 +26,6 @@ preferred-citation:
   title: "Paleoecology Meta-Analysis Skill"
   authors:
     - given-names: "paleoecology-research"
-  version: "2.1.0"
-  date-released: "2026-07-19"
+  version: "2.2.0"
+  date-released: "2026-08-03"
   license: MIT

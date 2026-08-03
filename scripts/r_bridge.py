@@ -25,6 +25,26 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 
+def _json_for_r(payload: Dict) -> str:
+    """Serialize JSON safely for an R single-quoted string literal.
+
+    Non-finite numeric values are converted to null because JSON and R do not
+    share the same spelling for NaN/Inf in a quoted payload. Backslashes and
+    apostrophes are escaped before embedding the JSON in R code.
+    """
+    def clean(value):
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            return None
+        return value
+
+    encoded = json.dumps(clean(payload), ensure_ascii=True, separators=(',', ':'))
+    return encoded.replace('\\', '\\\\').replace("'", "\\'")
+
+
 # ---------------------------------------------------------------------------
 # R 环境检测
 # ---------------------------------------------------------------------------
@@ -303,19 +323,24 @@ def rma_random_effects(
     """
     yi = np.asarray(effect_sizes, dtype=float)
     vi = np.asarray(variances, dtype=float)
+    if yi.ndim != 1 or vi.ndim != 1 or len(yi) != len(vi):
+        raise ValueError('effect_sizes 与 variances 必须是一维且长度一致。')
+    if len(yi) < 2 or np.any(~np.isfinite(yi)) or np.any(~np.isfinite(vi)) or np.any(vi <= 0):
+        raise ValueError('效应量必须有限，方差必须为正，且至少有两个研究。')
 
     # --- 尝试 R + metafor ---
-    data_json = json.dumps({
+    data_json = _json_for_r({
         'yi': yi.tolist(),
         'vi': vi.tolist(),
         'method': method,
         'knha': knha,
+        'test': 'knha' if knha else 'z',
     })
 
     r_code = f'''
 library(metafor)
 data <- jsonlite::fromJSON('{data_json}')
-rma_fit <- rma(yi=data$yi, vi=data$vi, method=data$method, knha=data$knha)
+rma_fit <- rma(yi=data$yi, vi=data$vi, method=data$method, test=data$test)
 result <- list(
     success = TRUE,
     pooled_effect = as.numeric(rma_fit$b),
@@ -359,6 +384,12 @@ def _rma_python_fallback(
     """
     from scipy import stats as sp_stats
 
+    yi = np.asarray(yi, dtype=float)
+    vi = np.asarray(vi, dtype=float)
+    if yi.ndim != 1 or vi.ndim != 1 or len(yi) != len(vi):
+        raise ValueError('yi 与 vi 必须是一维且长度一致。')
+    if np.any(~np.isfinite(yi)) or np.any(~np.isfinite(vi)) or np.any(vi <= 0):
+        raise ValueError('yi 必须有限，vi 必须为正。')
     n = len(yi)
     if n < 2:
         return {'error': '需至少 2 个研究进行随机效应合并'}
@@ -394,12 +425,21 @@ def _rma_python_fallback(
         )
         se_random = se_random * hk_factor
 
-    # 置信区间和检验
-    z_crit = sp_stats.norm.ppf(0.975)
-    ci_lower = pooled_random - z_crit * se_random
-    ci_upper = pooled_random + z_crit * se_random
-    z_value = pooled_random / se_random
-    p_value = 2 * (1 - sp_stats.norm.cdf(abs(z_value)))
+    # Hartung-Knapp 使用 t 分布；没有 HK 时才使用正态近似。
+    if knha and n > 2:
+        critical = sp_stats.t.ppf(0.975, df)
+        ci_lower = pooled_random - critical * se_random
+        ci_upper = pooled_random + critical * se_random
+        test_value = pooled_random / se_random
+        p_value = 2 * (1 - sp_stats.t.cdf(abs(test_value), df))
+        test_name = 'knha'
+    else:
+        critical = sp_stats.norm.ppf(0.975)
+        ci_lower = pooled_random - critical * se_random
+        ci_upper = pooled_random + critical * se_random
+        test_value = pooled_random / se_random
+        p_value = 2 * (1 - sp_stats.norm.cdf(abs(test_value)))
+        test_name = 'z'
 
     return {
         'success': True,
@@ -407,7 +447,7 @@ def _rma_python_fallback(
         'se': float(se_random),
         'ci_lower': float(ci_lower),
         'ci_upper': float(ci_upper),
-        'z_value': float(z_value),
+        'z_value': float(test_value),
         'p_value': float(p_value),
         'I2': float(I2),
         'tau2': float(tau2),
@@ -415,6 +455,7 @@ def _rma_python_fallback(
         'Q_pvalue': float(Q_pvalue),
         'method': 'DL',
         'knha': knha,
+        'test': test_name,
         'backend': 'python',
         'note': '使用 DerSimonian-Laird 估计（metafor 不可用时的回退）。'
                 '安装 metafor 可获得 REML/ML 等高级估计方法。',
@@ -458,7 +499,7 @@ def meta_regression(
     if mods.ndim == 1:
         mods = mods[:, np.newaxis]
 
-    data_json = json.dumps({
+    data_json = _json_for_r({
         'yi': yi.tolist(),
         'vi': vi.tolist(),
         'mods': mods.tolist(),
@@ -528,7 +569,7 @@ def egger_test(
     vi = np.asarray(variances, dtype=float)
     sei = np.sqrt(vi)
 
-    data_json = json.dumps({
+    data_json = _json_for_r({
         'yi': yi.tolist(),
         'sei': sei.tolist(),
     })
@@ -554,13 +595,18 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
     if r_result['success'] and r_result['result'].get('success'):
         return r_result['result']
 
-    # Python 回退：简单线性回归 yi ~ sei
+    # Python 回退：Egger 型回归 z_i = beta_0 + beta_1 * precision_i。
+    # 该回退用于诊断，不宣称与 metafor::regtest 完全等价。
     from scipy import stats as sp_stats
 
     if len(yi) < 3:
         return {'error': 'Egger 检验需至少 3 个研究'}
 
-    slope, intercept, r, p_val, se = sp_stats.linregress(sei, yi)
+    if np.any(sei <= 0) or not np.all(np.isfinite(sei)):
+        return {'success': False, 'error': '标准误必须为正且有限。', 'backend': 'python'}
+    precision = 1.0 / sei
+    standardized = yi / sei
+    slope, intercept, r, p_val, se = sp_stats.linregress(precision, standardized)
 
     return {
         'success': True,
@@ -569,7 +615,7 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
         'intercept': float(intercept),
         'intercept_se': float(se),
         'backend': 'python',
-        'note': '使用简单线性回归回退（metafor 不可用）。',
+        'note': '使用 Egger 型精度回归回退；不等同于 metafor::regtest。',
     }
 
 
@@ -609,7 +655,7 @@ def forest_plot(
     # Windows 路径反斜杠会导致 JSON 词法错误，统一转为正斜杠
     output_abs = os.path.abspath(output_path).replace('\\', '/')
 
-    data_json = json.dumps({
+    data_json = _json_for_r({
         'yi': yi.tolist(),
         'vi': vi.tolist(),
         'labels': study_labels,
@@ -673,7 +719,7 @@ def funnel_plot(
     # Windows 路径反斜杠会导致 JSON 词法错误，统一转为正斜杠
     output_abs = os.path.abspath(output_path).replace('\\', '/')
 
-    data_json = json.dumps({
+    data_json = _json_for_r({
         'yi': yi.tolist(),
         'vi': vi.tolist(),
         'output': output_abs,
@@ -734,7 +780,7 @@ def subgroup_analysis(
     vi = np.asarray(variances, dtype=float)
     groups = np.asarray(groups)
 
-    data_json = json.dumps({
+    data_json = _json_for_r({
         'yi': yi.tolist(),
         'vi': vi.tolist(),
         'groups': groups.tolist(),
@@ -777,9 +823,7 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
     if r_result['success'] and r_result['result'].get('success'):
         return r_result['result']
 
-    # Python 回退：逐组计算
-    from scipy import stats as sp_stats
-
+    # Python 回退：逐组使用同一 DL/HK 实现；组间 Q 仍需要 metafor。
     subgroups = {}
     for g in np.unique(groups):
         mask = groups == g
@@ -787,20 +831,16 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
             continue
         yi_g = yi[mask]
         vi_g = vi[mask]
-        w = 1.0 / vi_g
-        pooled = np.sum(w * yi_g) / np.sum(w)
-        se = np.sqrt(1.0 / np.sum(w))
-        z = pooled / se
-        p = 2 * (1 - sp_stats.norm.cdf(abs(z)))
+        group_result = _rma_python_fallback(yi_g, vi_g, method='DL', knha=True)
         subgroups[str(g)] = {
             'n': int(mask.sum()),
-            'pooled': float(pooled),
-            'se': float(se),
-            'ci_lower': float(pooled - 1.96 * se),
-            'ci_upper': float(pooled + 1.96 * se),
-            'p_value': float(p),
-            'I2': None,
-            'tau2': None,
+            'pooled': group_result.get('pooled_effect'),
+            'se': group_result.get('se'),
+            'ci_lower': group_result.get('ci_lower'),
+            'ci_upper': group_result.get('ci_upper'),
+            'p_value': group_result.get('p_value'),
+            'I2': group_result.get('I2'),
+            'tau2': group_result.get('tau2'),
         }
 
     return {

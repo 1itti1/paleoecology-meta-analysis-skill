@@ -13,9 +13,15 @@
 """
 
 from typing import Callable, Dict, Optional, Tuple, Union
+import warnings
 
 import numpy as np
 from scipy.stats import bootstrap, norm
+
+try:
+    from ._utils import as_float_array, get_rng, validate_same_length
+except ImportError:  # pragma: no cover - supports direct script imports
+    from _utils import as_float_array, get_rng, validate_same_length
 
 
 def log_response_ratio(
@@ -47,12 +53,15 @@ def log_response_ratio(
     ValueError
         若数据含零值或负值（log response ratio 无定义）。
     """
-    if np.any(x_treatment <= 0) or np.any(x_control <= 0):
+    treatment = as_float_array(x_treatment, 'x_treatment', ndim=1, allow_nan=False)
+    control = as_float_array(x_control, 'x_control', ndim=1, allow_nan=False)
+    validate_same_length(('x_treatment', treatment), ('x_control', control))
+    if np.any(treatment <= 0) or np.any(control <= 0):
         raise ValueError(
             "log response ratio 要求 X_T 和 X_C 均为正值。"
             "含零值或负值时请改用 hedges_d()。"
         )
-    return np.log(x_treatment / x_control)
+    return np.log(treatment / control)
 
 
 def log_response_ratio_variance(
@@ -81,9 +90,15 @@ def log_response_ratio_variance(
     float
         log response ratio 的方差。
     """
-    mean_t = np.mean(x_t)
-    mean_c = np.mean(x_c)
-    return (s_t ** 2 / (n_t * mean_t ** 2)) + (s_c ** 2 / (n_c * mean_c ** 2))
+    x_t = as_float_array(x_t, 'x_t', ndim=1, allow_nan=False)
+    x_c = as_float_array(x_c, 'x_c', ndim=1, allow_nan=False)
+    if n_t < 1 or n_c < 1 or s_t < 0 or s_c < 0:
+        raise ValueError('样本量必须为正，标准差必须非负。')
+    mean_t = float(np.mean(x_t))
+    mean_c = float(np.mean(x_c))
+    if mean_t <= 0 or mean_c <= 0:
+        raise ValueError('log response ratio 的均值必须为正。')
+    return float((s_t ** 2 / (n_t * mean_t ** 2)) + (s_c ** 2 / (n_c * mean_c ** 2)))
 
 
 def hedges_d(
@@ -109,23 +124,32 @@ def hedges_d(
     Dict
         {'d': float, 'variance': float, 'J_correction': float, 'n_t': int, 'n_c': int}
     """
-    n_t = len(x_treatment)
-    n_c = len(x_control)
-    mean_t = np.mean(x_treatment)
-    mean_c = np.mean(x_control)
-    var_t = np.var(x_treatment, ddof=1)
-    var_c = np.var(x_control, ddof=1)
+    treatment = as_float_array(x_treatment, 'x_treatment', ndim=1, allow_nan=False, min_size=2)
+    control = as_float_array(x_control, 'x_control', ndim=1, allow_nan=False, min_size=2)
+    n_t = len(treatment)
+    n_c = len(control)
+    mean_t = np.mean(treatment)
+    mean_c = np.mean(control)
+    var_t = np.var(treatment, ddof=1)
+    var_c = np.var(control, ddof=1)
 
     # 合并标准差
     s_pooled = np.sqrt(
         ((n_t - 1) * var_t + (n_c - 1) * var_c) / (n_t + n_c - 2)
     )
 
-    # Cohen's d
-    d_raw = (mean_t - mean_c) / s_pooled
+    if not np.isfinite(s_pooled):
+        raise ValueError('合并标准差不是有限值。')
+    if s_pooled == 0:
+        if mean_t == mean_c:
+            d_raw = 0.0
+        else:
+            raise ValueError('两组方差均为零但均值不同，Hedges\' g 无有限定义。')
+    else:
+        d_raw = (mean_t - mean_c) / s_pooled
 
     # 小样本校正因子 J(df)
-    df = n_t + n_c - 3
+    df = n_t + n_c - 2
     J = 1 - (3 / (4 * df - 1))
     d = d_raw * J
 
@@ -147,6 +171,7 @@ def effect_size_bca(
     effect_type: str = 'lnrr',
     n_boot: int = 10000,
     confidence_level: float = 0.95,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """Izdebski 2022 BCa 方法估计效应量置信区间。
 
@@ -173,77 +198,92 @@ def effect_size_bca(
         {'effect_size': float, 'ci_lower': float, 'ci_upper': float,
          'n_t': int, 'n_c': int, 'significant': bool, 'method': 'BCa'}
     """
-    n_t = len(x_treatment)
-    n_c = len(x_control)
+    treatment = as_float_array(x_treatment, 'x_treatment', ndim=1, allow_nan=False)
+    control = as_float_array(x_control, 'x_control', ndim=1, allow_nan=False)
+    if n_boot < 100:
+        raise ValueError('n_boot 至少为 100。')
+    if not 0 < confidence_level < 1:
+        raise ValueError('confidence_level 必须位于 (0, 1)。')
+    n_t, n_c = len(treatment), len(control)
 
     if min(n_t, n_c) < 20:
-        import warnings
         warnings.warn(
-            f"样本量 n_t={n_t}, n_c={n_c}，BCa 要求 n>20。"
-            "置信区间可能不稳定，建议改用百分位法并报告样本量限制。"
+            f"样本量 n_t={n_t}, n_c={n_c}，BCa 加速因子可能不稳定。",
+            RuntimeWarning,
         )
 
     if effect_type == 'lnrr':
-        ratios = log_response_ratio(x_treatment, x_control)
+        validate_same_length(('x_treatment', treatment), ('x_control', control))
+        ratios = log_response_ratio(treatment, control)
         point_estimate = np.mean(ratios)
+        data = (ratios,)
 
-        def statistic(data, axis=None):
-            return np.mean(data, axis=axis)
-
-        result = bootstrap(
-            (ratios,),
-            statistic=np.mean,
-            n_resamples=n_boot,
-            method='BCa',
-            confidence_level=confidence_level,
-        )
+        def statistic(values, axis=-1):
+            return np.nanmean(values, axis=axis)
 
     elif effect_type == 'd':
-        d_result = hedges_d(x_treatment, x_control)
+        d_result = hedges_d(treatment, control)
         point_estimate = d_result['d']
 
-        # 对两组合并后重采样
-        combined = np.concatenate([x_treatment, x_control])
-        labels = np.concatenate([np.ones(n_t), np.zeros(n_c)])
-
-        def statistic(data, axis=None):
-            if axis is None:
-                t = data[labels == 1]
-                c = data[labels == 0]
-                return hedges_d(t, c)['d']
-            # 批量处理
-            n_total = data.shape[axis]
-            t_idx = labels == 1
-            c_idx = labels == 0
-            t_data = np.take(data, np.where(t_idx)[0], axis=axis)
-            c_data = np.take(data, np.where(c_idx)[0], axis=axis)
-            mean_t = np.mean(t_data, axis=axis)
-            mean_c = np.mean(c_data, axis=axis)
-            return mean_t - mean_c
-
-        result = bootstrap(
-            (combined,),
-            statistic=statistic,
-            n_resamples=n_boot,
-            method='BCa',
-            confidence_level=confidence_level,
-        )
+        def statistic(treatment_values, control_values, axis=-1):
+            mean_t = np.mean(treatment_values, axis=axis)
+            mean_c = np.mean(control_values, axis=axis)
+            var_t = np.var(treatment_values, axis=axis, ddof=1)
+            var_c = np.var(control_values, axis=axis, ddof=1)
+            pooled = np.sqrt(((n_t - 1) * var_t + (n_c - 1) * var_c) / (n_t + n_c - 2))
+            df = n_t + n_c - 2
+            correction = 1 - (3 / (4 * df - 1))
+            return correction * np.divide(
+                mean_t - mean_c,
+                pooled,
+                out=np.zeros_like(mean_t, dtype=float),
+                where=pooled > 0,
+            )
+        data = (treatment, control)
 
     else:
         raise ValueError("effect_type 须为 'lnrr' 或 'd'")
 
-    ci_lower = result.confidence_interval.low
-    ci_upper = result.confidence_interval.high
+    rng = get_rng(random_state)
+    try:
+        result = bootstrap(
+            data,
+            statistic=statistic,
+            n_resamples=n_boot,
+            method='BCa',
+            confidence_level=confidence_level,
+            random_state=rng,
+        )
+        ci_method = 'BCa'
+    except Exception as exc:
+        warnings.warn(
+            f'BCa 计算失败，改用 percentile 区间：{exc}',
+            RuntimeWarning,
+        )
+        result = bootstrap(
+            data,
+            statistic=statistic,
+            n_resamples=n_boot,
+            method='percentile',
+            confidence_level=confidence_level,
+            random_state=rng,
+        )
+        ci_method = 'percentile_fallback'
+
+    ci_lower = float(result.confidence_interval.low)
+    ci_upper = float(result.confidence_interval.high)
+    if not np.isfinite(ci_lower) or not np.isfinite(ci_upper):
+        raise ValueError('Bootstrap 区间不是有限值；请检查样本量、方差和重复值。')
     significant = not (ci_lower <= 0 <= ci_upper)
 
     return {
-        'effect_size': point_estimate,
+        'effect_size': float(point_estimate),
         'ci_lower': ci_lower,
         'ci_upper': ci_upper,
         'n_t': n_t,
         'n_c': n_c,
         'significant': significant,
-        'method': 'BCa',
+        'method': ci_method,
         'effect_type': effect_type,
         'n_boot': n_boot,
     }
@@ -266,14 +306,22 @@ def rmsep(predicted: np.ndarray, observed: np.ndarray) -> Dict:
     Dict
         {'rmsep': float, 'bias': float, 'n': int}
     """
-    n = len(predicted)
-    rmsep_val = np.sqrt(np.mean((predicted - observed) ** 2))
-    bias = np.mean(predicted - observed)
+    predicted = as_float_array(predicted, 'predicted', ndim=1)
+    observed = as_float_array(observed, 'observed', ndim=1)
+    validate_same_length(('predicted', predicted), ('observed', observed))
+    valid = np.isfinite(predicted) & np.isfinite(observed)
+    if not np.any(valid):
+        raise ValueError('predicted 与 observed 没有共同的有限观测。')
+    residuals = predicted[valid] - observed[valid]
+    n = len(residuals)
+    rmsep_val = np.sqrt(np.mean(residuals ** 2))
+    bias = np.mean(residuals)
 
     return {
         'rmsep': rmsep_val,
         'bias': bias,
         'n': n,
+        'n_missing': int(len(predicted) - n),
     }
 
 

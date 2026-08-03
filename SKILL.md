@@ -1,189 +1,223 @@
 ---
 name: paleoecology-meta-analysis
 description: >-
-  Paleoecology and paleoclimate meta-analysis for multi-proxy, multi-region
-  research: BAM age ensembles, multi-site synthesis (SCC/DCC/CPS/PAI/GAM),
-  Bootstrap BCa uncertainty, effect sizes, continuous proxy calibration
-  (δDwax/brGDGTs). Supports taxa and continuous proxy dual-channel workflows.
-  Invoke when synthesizing paleoecological time-series, validating proxy
-  indicators, or attributing environmental changes across sites.
-license: MIT license
-compatibility: >-
-  Requires Python 3.9+. Core: numpy, scipy>=1.7, pandas, statsmodels>=0.14.
-  Synthesis: pygam. Bayesian: pymc>=5.0, arviz>=1.0. Geo: pysal, cartopy.
-  Paleo: pylipd, pyleoclim. Optional R bridge: R 4.0+ with metafor package
-  enables rma(), Egger test, forest/funnel plots via subprocess. Falls back
-  to Python DerSimonian-Laird when R unavailable. BAM (pure Python) replaces
-  Bacon/Clam age models.
-metadata: {"version": "2.1", "skill-author": "paleoecology-research", "based-on": "paleoecology-meta-analysis.html"}
+  Generic, reproducible synthesis of multi-site paleoecology and paleoclimate
+  proxy records. Use for data audits, chronology-ensemble alignment, taxa or
+  continuous-proxy standardization, regional time-series synthesis, paired
+  proxy validation, uncertainty propagation, dependence checks, and cautious
+  climate-versus-human-activity comparisons. Supports pollen, diatoms,
+  foraminifera, plant macrofossils, charcoal, biomarkers, isotopes, and other
+  stratigraphic proxies without assuming a region, archive, proxy calibration,
+  or causal interpretation.
 ---
 
-# Paleoecology Meta-Analysis
+# Generic paleoecology proxy synthesis
 
-## Overview
+Use this skill as an analysis workflow, not as an automatic attribution engine.
+Start by identifying the estimand, archive, proxy type, chronology source, and
+dependence structure. Keep observed data, transformations, model outputs, and
+interpretations separate.
 
-面向古生态学与古气候学多代理指标、多研究区域的 meta 分析技能。支持分类群百分比型代理（花粉、硅藻、有孔虫、大植物化石等）和连续值型代理（δDwax、brGDGTs、粒度、有机碳、Mg/Ca 等）的双通道并行工作流。
+## Operating rules
 
-采用混合方法路线：以古生态学原生综合方法（z-score 标准化、Bootstrap BCa、GAM、蒙特卡洛集合）为主体，以经典效应量（log response ratio、Hedges' d）为条件模块。方法选择以数据结构为判据——配对比较结构激活效应量模块，时序叠加结构仅用原生综合方法。
+1. Audit the data before selecting a method.
+2. Prefer an existing calibrated age-model posterior or ensemble. Do not label
+   random perturbation of dated horizons as Bacon, Bchron, Clam, or BAM.
+3. Preserve raw counts, denominators, units, site IDs, sample IDs, and source
+   metadata. Never overwrite raw values with percentages or z-scores.
+4. Treat compositional taxa data and continuous proxies as different channels.
+5. Propagate uncertainty independently for each site before regional synthesis;
+   do not silently reuse one site's age ensemble for all sites.
+6. Renormalize weights when values are missing at a time bin. Do not silently
+   extrapolate outside an observed age range.
+7. Treat LOESS/GAM as descriptive unless the model includes an explicit
+   inferential likelihood, uncertainty, and dependence structure.
+8. Treat before/after results as associations unless a design includes controls,
+   covariates, lags, and a defensible counterfactual.
+9. Report the actual backend, package versions, random seed, member count,
+   missingness, excluded samples, and all sensitivity choices.
+10. Fail loudly on invalid shapes, non-positive variances, missing time axes,
+    unsupported age layouts, and non-finite effect-size inputs.
 
-区域特定功能（如喀斯特保存偏倚、干旱区保存偏倚）以预设插件形式提供，默认 auto 自动选择，不强制任何特定地理环境。
+## Required data contract
 
-混合 R 桥接架构（v2.1 新增）：当系统检测到 R + metafor 包时，经典 meta 分析功能（`rma()` 随机效应模型、Egger 发表偏倚检验、森林图、漏斗图、meta 回归、亚组分析）自动调用 metafor 后端；R 不可用时自动回退到 Python 的 DerSimonian-Laird 实现。数据交换通过 subprocess + Rscript + JSON，不依赖 rpy2。BAM（纯 Python）始终替代 Bacon/Clam 年龄模型，REVEALS 模型用 z-score 替代（缺口已标注）。
+Normalize inputs to a table or dictionary with these fields before analysis:
 
-全部方法基于 7 篇核心文献：Izdebski 2022 (Nat Ecol Evol)、Kaufman 2020 (Sci Data)、Marlon 2008 (Nat Geosci)、Power 2008 (Clim Dyn)、Roberts 2018 (Sci Rep)、Hedges 1999 (Ecology)、Lajeunesse 2009 (Am Nat)。R 桥接模块额外基于 Viechtbauer 2010 (J Stat Soft, metafor)、Hartung & Knapp 2001 (Biometrics)、Higgins & Thompson 2002 (JRSS-A, I²)、Egger et al. 1997 (BMJ)。
+| Field | Requirement |
+|---|---|
+| `site_id` | Stable site/core/archive identifier |
+| `sample_id` | Stable sample or depth identifier |
+| `depth` | Optional but required for depth-based age modelling |
+| `age` | One age per sample, with units and calendar convention |
+| `age_error` | Optional 1-sigma horizon uncertainty; not an age model |
+| `age_ensembles` | Preferred posterior/ensemble, shaped per site as members × samples |
+| `value` or taxa columns | Raw measurement or count data |
+| `count_sum` | Required for count-based taxa data when available |
+| `lat`, `lon`, `elevation` | Required only for spatial analyses |
+| `source`, `method`, `unit` | Provenance and measurement metadata |
 
-## When to Use This Skill
+For ragged multi-site data, keep a list of per-site arrays or long-form rows.
+Do not pad observations with zeros. Use `NaN` only for genuinely missing values.
 
-- 多站点古生态学/古气候学数据的 meta 分析合成（任意代理类型、任意研究区域）
-- 代用指标有效性评估（推断值 vs 观测真值配对比较）
-- 事件归因分析（政策、战乱、气候事件、土地利用变化前后准实验比较）
-- 年龄-深度建模与年龄不确定性传播
-- 连续值代理校准与交叉验证（δDwax/brGDGTs 等）
-- Bootstrap BCa 置信区间估计
-- 需要经得起同行评审的统计严谨性检查（假设检验、多方法交叉验证、三层不确定性传播）
+## Workflow
 
-## Dual-Channel Architecture
+### 1. Define the question and design
 
-本技能支持两套并行通道，根据代理数据类型自动分派：
+Write down the response variable, comparison unit, time direction, target
+estimand, and whether the analysis is descriptive, predictive, associational,
+or causal. Select one of these designs:
 
-| 通道 | 适用代理 | 核心模块 | 标准化 | 合成方法 |
-|------|---------|---------|--------|---------|
-| 分类群通道 | 花粉、硅藻、有孔虫、孢粉、大植物化石 | preprocessing + synthesis | z-score | SCC/DCC/CPS/PAI/GAM |
-| 连续值通道 | δDwax、brGDGTs、粒度、TOC、Mg/Ca、Uk37 | continuous_proxy | z-score/minmax/robust | 加权均值 + 蒙特卡洛集合 |
+| Design | Use | Do not do |
+|---|---|---|
+| `paired_comparison` | Proxy versus an observed/reference value | Pool unrelated time-series points as independent replicates |
+| `time_series_stacking` | Multiple records aligned to a common time grid | Apply classic independent-study effect sizes to site stacks |
+| `before_after` | Event-window comparison | Call a raw pre/post contrast a causal effect |
+| `calibration` | Proxy–environment training/validation | Report in-sample fit as predictive skill |
 
-两通道共享 effect_size、validation、scenarios 模块，确保统计严谨性标准一致。
+Use `scripts/scenarios.py::select_scenario` only after this design decision.
 
-## Hybrid R Bridge (v2.1+)
+### 2. Audit and harmonize
 
-经典 meta 分析功能通过 `r_bridge.py` 模块实现混合后端架构：
+Use `harmonize_names` for an explicit mapping table. Record unmapped names and
+do not infer that absent taxa are true zeros. Check duplicate ages, age order,
+units, sample counts, detection limits, taxonomic resolution, laboratory
+methods, aquatic/local taxa, sediment mixing, and preservation context.
 
-| 后端 | 触发条件 | 功能范围 | 估计方法 |
-|------|---------|---------|---------|
-| **metafor** (R) | R 4.0+ + metafor 已安装 | rma、meta 回归、Egger 检验、森林图、漏斗图、亚组分析 | REML/ML/DL/EB/HS 五种 |
-| **Python** (回退) | R 不可用或 metafor 未安装 | rma（DerSimonian-Laird） | 仅 DL |
+For taxa data, retain counts and calculate percentages only after checking the
+pollen/proxy sum. Consider log-ratio or count-based models when closure,
+zero-inflation, or unequal count sums affect the estimand. `build_indicators`
+is a user-defined aggregation helper; it is not an ecological classification
+validated for every region.
 
-**数据交换方式**：Python → JSON → Rscript subprocess → JSON → Python，不依赖 rpy2。
+Use `record_preservation_bias` to document a hypothesized bias and its evidence.
+Its presets are flags and sensitivity-analysis inputs, not automatic corrections.
 
-**自动检测**：`check_r_environment()` 在首次调用时检测 R 路径和包状态，结果缓存在后续调用中。`get_backend()` 返回当前激活的后端类型。
+### 3. Handle chronology
 
-**关键参数**：`knha=True`（Hartung-Knapp 校正，默认开启，控制 I 类错误率）；`method='REML'`（默认估计方法，限制最大似然）。
+Preferred order:
 
-## Installation
+1. Load a published or externally fitted posterior/ensemble with
+   `consume_bacon_ages` or an equivalent loader.
+2. Validate dimensions, monotonicity, age direction, calibration, and the
+   number of members.
+3. Use `resample_to_grid` or
+   `scripts/_utils.py::interpolate_no_extrapolation` for each site/member.
+4. Use `age_ensemble_from_errors` only as a transparent sensitivity analysis
+   when no posterior exists. Its output must be reported as perturbed-horizon
+   uncertainty, not as a fitted chronology.
 
-```bash
-# 核心层
-uv pip install "scipy>=1.7" "statsmodels>=0.14" pandas numpy
+The compatibility wrapper `bam_age_ensemble` is retained for old notebooks but
+is deprecated and reports `method='age_perturbation'`.
 
-# 合成层（分类群通道 GAM 合成）
-uv pip install "pygam>=0.8"
+### 4. Standardize without losing meaning
 
-# 连续值通道校准验证（k-fold 交叉验证）
-uv pip install "scikit-learn>=1.0"
+Use `zscore_standardize` or `standardize_continuous_proxy` only after choosing
+the baseline and supplying an explicit age vector when a baseline period is
+used. Record the baseline, mean, scale, missing-value rule, and denominator.
 
-# 贝叶斯层
-uv pip install "pymc>=5.0" "arviz>=1.0"
+Do not standardize age, depth, latitude, or other metadata as if they were proxy
+variables. For cross-site synthesis, standardize within the declared site or
+calibration group and justify any cross-site scaling.
 
-# 地理层
-uv pip install "pysal" cartopy
+### 5. Align and synthesize
 
-# 古气候层
-uv pip install pylipd pyleoclim
-```
+For multi-site records:
 
-**可选 R 桥接**（启用 metafor 后端）：
+1. Interpolate each site separately onto the declared grid.
+2. Use `scc_composite` or a weighted mean for already comparable calibrated
+   values; weights are re-normalized per time bin.
+3. Use `cps_composite` only when a common calibration scale and baseline are
+   defensible.
+4. Use `gam_composite` for a descriptive smooth and report smoothing choices.
+5. Use `pai_composite` only for directional agreement; ties and missing values
+   must remain neutral/undefined rather than being counted as decreases.
+6. Compare methods as a sensitivity analysis, not as independent confirmations.
 
-```bash
-# 1. 安装 R 4.0+: https://cran.r-project.org/
-# 2. 在 R 中安装 metafor:
-install.packages("metafor")
-# 3. 验证:
-Rscript -e "library(metafor); cat('metafor OK\n')"
-```
+For continuous proxies, use `composite_continuous_proxy` with ragged per-site
+arrays or a documented common shape. A shared age ensemble is valid only when
+the same chronology applies to all sites; otherwise pass one ensemble per site.
 
-安装后 `r_bridge.py` 自动检测并启用 metafor 后端；未安装时回退到 Python DerSimonian-Laird 实现，功能不中断。
+### 6. Propagate uncertainty
 
-**版本兼容性提示**：SciPy 1.7+ 的 `scipy.stats.bootstrap` 默认使用 BCa 方法。PyGAM 的 `LinearGAM` 支持 GCV 自动平滑参数选择。PyMC 5.x 与 ArviZ 1.x 兼容，贝叶斯 GAM 报告时须显式指定 `ci_prob=0.95`。metafor 建议 3.0+ 版本以支持 Hartung-Knapp 校正。
+Use `monte_carlo_ensemble`, `propagate_continuous_uncertainty`, or
+`propagate_three_layer_uncertainty` only after specifying which uncertainty
+layers are actually available:
 
-## Scenario Selection Guide
+- chronology: posterior/ensemble member;
+- measurement or calibration: reported error model or residual distribution;
+- sampling/site uncertainty: an appropriate bootstrap or hierarchical model.
 
-根据数据结构特征选择场景：
+Use a local `random_state`. Label percentile bands as uncertainty quantiles or
+bootstrap intervals; do not call them Bayesian credible intervals unless a
+Bayesian model generated them. Check member-count sensitivity and Monte Carlo
+stability.
 
-**数据存在配对比较结构？**
-- 推断值 vs 真值 → **场景一**：代用指标有效性评估（z-score → LOOCV → log response ratio → BCa → RMSEP）
-- 事件前 vs 事件后 → **场景三**：事件归因分析（z-score + 多指标 → BCa 差异检验 → 多窗口 → 双指标 → 可选效应量）
+### 7. Validate dependence and robustness
 
-**多点时序叠加** → **场景二**：多站点变化综合（BAM 年龄集合 → z-score → 时空对齐 → SCC/GAM/CPS 合成 → 500 成员集合 → LOESS → 多方法交叉验证）
+Run the relevant checks in `validation.py`:
 
-详细决策流程图见 `references/scenarios.md`。
+- finite-value and sample-size checks;
+- temporal autocorrelation after considering trend/residual structure;
+- spatial autocorrelation with a declared coordinate distance and neighborhood;
+- block or moving-block bootstrap for dependent series;
+- leave-one-site-out and parameter sensitivity checks;
+- multiple windows, indicators, taxa, or proxies with multiplicity acknowledged.
 
-## Module Reference
+Normality tests are diagnostics, not a prerequisite for every bootstrap. Do not
+use arbitrary p-value thresholds as the sole robustness criterion.
 
-| 模块 | 文档章节 | Reference 文件 | Script 文件 | 核心函数 |
-|------|---------|---------------|------------|---------|
-| 数据预处理 | 第三章 | `preprocessing.md` | `preprocessing.py` | bam_age_ensemble, zscore_standardize, resample_to_grid, spatial_clustering(auto), harmonize_names, record_preservation_bias(presets) |
-| 连续值代理 | 第三章扩展 | `preprocessing.md` | `continuous_proxy.py` | standardize_continuous_proxy, calibrate_continuous_proxy, composite_continuous_proxy, propagate_continuous_uncertainty, cross_validate_calibration, proxy_comparison |
-| 原生综合方法 | 第四章 | `synthesis_methods.md` | `synthesis.py` | scc_composite, gam_composite, monte_carlo_ensemble |
-| 效应量模块 | 第五章 | `effect_size.md` | `effect_size.py` | log_response_ratio, effect_size_bca, rmsep |
-| 三场景配置 | 第六章 | `scenarios.md` | `scenarios.py` | scenario1_proxy_validation, scenario2_multi_site_synthesis, scenario3_human_attribution, build_indicators |
-| 统计严谨性 | 第七章 | `validation.md` | `validation.py` | check_normality_bootstrap, propagate_three_layer_uncertainty |
-| R 桥接（可选） | 第五章扩展 | `effect_size.md` | `r_bridge.py` | rma_random_effects, meta_regression, egger_test, forest_plot, funnel_plot, subgroup_analysis |
+### 8. Report and interpret
 
-**模块依赖关系**：`preprocessing` + `continuous_proxy` 被所有场景依赖 → `synthesis` 被场景二、三依赖 → `effect_size` 被场景一、三依赖 → `r_bridge` 可选增强 `effect_size`（R 可用时替换 Python 回退） → `validation` 被所有场景调用 → `scenarios` 依赖前六个模块。
+Return a dictionary containing estimates, interval type, method, input shape,
+valid sample count, site count, seed, backend, and warnings. Produce a compact
+provenance record with:
 
-## Statistical Rigor Quick Reference
+- input files and hashes when available;
+- preprocessing and taxon mappings;
+- chronology source and member shape;
+- grid, baseline, weights, smoothing, bootstrap, and multiple-testing choices;
+- excluded or extrapolated bins (normally none);
+- limitations and alternative explanations.
 
-**假设检查清单**（执行前必查）：
-- 正态性：Shapiro-Wilk + Q-Q 图（n>30 时 Bootstrap 渐近稳健）
-- 时间独立性：AR1 系数 + Durbin-Watson（违反时用块 Bootstrap）
-- 空间独立性：Moran's I（违反时空间聚类后再合成）
-- 样本量：n>20（BCa 最低）、n>30（渐近正态）
+Use `quasi_experiment_effect_size` and `scenario3_human_attribution` with
+association language. Climate and human indicators should be compared in a
+joint temporal framework when the scientific question is attribution.
 
-**三层不确定性传播**：
-- 年龄不确定性：从 BAM/Bacon 后验分布整体采样完整年龄-深度曲线（保持地层单调性）
-- 校准不确定性：代理-气候校准残差作为正态噪声，标准差来自 RMSEP
-- 采样不确定性：Bootstrap 重采样自然传播
+## Module map
 
-**六验证策略**：LOOCV / 多方法一致性(≥2种) / 多时间窗口(100/50/25年) / 双指标系统 / 外部数据对比 / 敏感性分析
+- `scripts/preprocessing.py`: validation-aware chronology consumption,
+  perturbation sensitivity, standardization, interpolation, naming, and bias
+  documentation.
+- `scripts/synthesis.py`: SCC, DCC, CPS, PAI, descriptive GAM/LOESS, Monte
+  Carlo ensembles, and method sensitivity.
+- `scripts/continuous_proxy.py`: continuous-proxy calibration, ragged-site
+  synthesis, uncertainty, validation, and paired comparison.
+- `scripts/effect_size.py`: paired log-ratios, Hedges' g, BCa/percentile
+  intervals, RMSEP, and LOOCV. Use only when the design supports it.
+- `scripts/scenarios.py`: explicit orchestration for paired, stacked, and
+  before/after designs.
+- `scripts/validation.py`: dependence, bootstrap, leave-one-site-out,
+  sensitivity, and uncertainty diagnostics.
+- `scripts/r_bridge.py`: optional metafor backend. Treat Python fallbacks as a
+  documented subset, never as numerically identical replacements.
 
-详见 `references/validation.md` 和 `references/methodology_gaps.md`。
+Read only the relevant reference before a specialized analysis:
+`references/preprocessing.md`, `synthesis_methods.md`, `effect_size.md`,
+`scenarios.md`, `validation.md`, `python_toolchain.md`, and
+`methodology_gaps.md`.
 
-## Code Conventions
+## Optional dependencies and failure policy
 
-- **函数接口**：输入为 DataFrame/numpy 数组，输出为标准 Dict 结构（值 + 置信区间 + 元数据）
-- **参数命名**：`n_members=500`（Kaufman 2020 集合成员数）、`n_boot=10000`（Izdebski 2022 Bootstrap 次数）、`n_splines=20`（GAM 样条节点）、`frac=0.2`（LOESS 平滑参数）
-- **docstring**：每个函数首行标注文献来源，如 `"""Kaufman 2020 集合策略：传播三层不确定性"""`
-- **代理类型无关**：函数参数命名使用通用术语（`data`/`values`/`proxy_values`），不绑定特定代理类型
-- **区域无关**：空间方法默认 `auto`，区域特定功能（如保存偏倚）以预设插件提供
-- **依赖限制**：仅允许 `references/python_toolchain.md` 中已验证的包，遇缺口按 `references/methodology_gaps.md` 方案处理
+Core array/data operations require NumPy, SciPy, pandas, and statsmodels. See
+`requirements-optional.txt` for optional Python methods. PyGAM, scikit-learn,
+PySAL/ESDA, and R/metafor are optional;
+detect them at call time and state the fallback. Do not import optional modules
+at package import time.
 
-## Bundled Resources
+If a requested method is unavailable or its assumptions are not met, return a
+clear error or an explicitly labeled limited result. Never silently downgrade a
+chronology model, confidence-interval type, spatial model, or causal claim.
 
-### references/
-
-| 文件 | 内容 |
-|------|------|
-| `preprocessing.md` | BAM 年龄模型、z-score 标准化、时空对齐、分类群命名统一、多环境保存偏倚预设 |
-| `synthesis_methods.md` | SCC/DCC/CPS/PAI/GAM 五方法、Bootstrap BCa、LOESS、蒙特卡洛集合、REVEALS 缺口 |
-| `effect_size.md` | log response ratio、Hedges' d、适用边界、联合报告逻辑、系统发育扩展 |
-| `scenarios.md` | 三场景完整方法链、决策流程图、双通道架构、代码框架、常见陷阱 |
-| `validation.md` | 四假设检验、三层不确定性传播、六验证策略 |
-| `python_toolchain.md` | 12 项已验证工具表、版本兼容性、依赖限制规则 |
-| `methodology_gaps.md` | 四缺口处理方案、同行评审可辩护性清单 |
-
-### scripts/
-
-| 文件 | 函数数 | 核心功能 |
-|------|-------|---------|
-| `preprocessing.py` | 7 | 年龄集合生成、z-score 标准化、时空对齐(auto)、分类群命名统一、保存偏倚预设插件 |
-| `continuous_proxy.py` | 6 | 连续值代理标准化、校准、多站点合成、三层不确定性传播、交叉验证、双代理对比 |
-| `synthesis.py` | 10 | 五方法合成、蒙特卡洛集合、LOESS 趋势、多方法交叉验证 |
-| `effect_size.py` | 7 | log response ratio、Hedges' d、BCa 置信区间、LOOCV、RMSEP |
-| `scenarios.py` | 7 | 三场景双通道编排、指标构建(用户自定义)、事件前后检验、多窗口验证 |
-| `validation.py` | 9 | 假设检验、块 Bootstrap、逐一剔除、敏感性分析、三层传播 |
-| `r_bridge.py` | 11 | R+metafor 桥接：rma 随机效应、meta 回归、Egger 检验、森林图、漏斗图、亚组分析（R 不可用时回退到 Python DL 实现） |
-
-### 跨 Skill 协作
-
-- `effect_size.py` 的 `hedges_d()` 可补充调用 `statistical-analysis` skill 的 `pg.compute_efftype(eftype='hedges')`
-- `validation.py` 的 `check_normality_bootstrap()` 可调用 `statistical-analysis` skill 的 `assumption_checks.check_normality()`
-- `continuous_proxy.py` 的 `cross_validate_calibration()` 可调用 `scikit-learn` skill 的 `KFold` 实现
+The skill is MIT-licensed. The bundled code is a reproducible starting point,
+not a substitute for archive-specific proxy ecology, age modelling, or expert
+review.

@@ -9,11 +9,17 @@
 """
 
 from typing import Callable, Dict, List, Optional, Tuple, Union
+import warnings
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.stats import bootstrap
+
+try:
+    from ._utils import as_float_array, get_rng, normalize_weights
+except ImportError:  # pragma: no cover - supports direct script imports
+    from _utils import as_float_array, get_rng, normalize_weights
 
 
 def check_normality_bootstrap(
@@ -37,7 +43,9 @@ def check_normality_bootstrap(
     Dict
         {'statistic': float, 'p_value': float, 'is_normal': bool, 'recommendation': str}
     """
-    n = len(data)
+    values = as_float_array(data, 'data', ndim=1)
+    values = values[np.isfinite(values)]
+    n = len(values)
 
     if n < 3:
         return {
@@ -52,16 +60,16 @@ def check_normality_bootstrap(
         stat, p = stats.shapiro(data)
         is_normal = p > alpha
         if is_normal:
-            recommendation = '正态性假设满足，可使用 Bootstrap BCa'
+            recommendation = '该诊断未发现明显偏离；Bootstrap 是否合适仍取决于依赖结构和统计量。'
         elif n > 30:
-            recommendation = '正态性不满足但 n>30，Bootstrap 渐近稳健，可继续分析'
+            recommendation = '偏离正态；不要因此自动否定 Bootstrap，应检查统计量、依赖结构和尾部。'
         else:
-            recommendation = '正态性不满足且 n≤30，建议增加重采样次数至 20000 或改用非参数方法'
+            recommendation = '样本量较小且偏离正态；增加重采样次数不能替代合适的统计模型。'
     else:
         # 大样本用 D'Agostino-Pearson 检验
         stat, p = stats.normaltest(data)
         is_normal = p > alpha
-        recommendation = '大样本(n>5000)使用 D\'Agostino-Pearson 检验，Bootstrap 渐近稳健'
+        recommendation = '大样本使用 D\'Agostino-Pearson 诊断；重点检查依赖结构和异常值。'
 
     return {
         'statistic': stat,
@@ -76,6 +84,7 @@ def check_normality_bootstrap(
 def check_temporal_independence(
     data: Union[np.ndarray, pd.DataFrame],
     time_col: Optional[str] = None,
+    detrend: bool = True,
 ) -> Dict:
     """第七章 7.1 时间独立性假设检验。
 
@@ -95,12 +104,20 @@ def check_temporal_independence(
         {'ar1': float, 'dw_statistic': float, 'is_independent': bool, 'recommendation': str}
     """
     if isinstance(data, pd.DataFrame) and time_col is not None:
+        if time_col not in data.columns:
+            raise ValueError(f'time_col 不存在：{time_col}')
         data = data.sort_values(time_col)
-        values = data.drop(columns=[time_col]).select_dtypes(include=[np.number])
-        # 取第一数值列
-        values = values.iloc[:, 0].values
+        time = as_float_array(data[time_col].values, 'time', ndim=1, allow_nan=False)
+        numeric = data.drop(columns=[time_col]).select_dtypes(include=[np.number])
+        if numeric.shape[1] == 0:
+            raise ValueError('DataFrame 没有可检验的数值列。')
+        values = as_float_array(numeric.iloc[:, 0].values, 'data', ndim=1)
     else:
-        values = np.asarray(data).ravel()
+        values = as_float_array(data, 'data', ndim=1)
+        time = np.arange(len(values), dtype=float)
+
+    valid = np.isfinite(values) & np.isfinite(time)
+    values, time = values[valid], time[valid]
 
     n = len(values)
 
@@ -112,20 +129,37 @@ def check_temporal_independence(
             'recommendation': '样本量不足，无法检验时间独立性',
         }
 
+    analysis_values = values
+    if detrend and n >= 4 and np.unique(time).size >= 2:
+        coeffs = np.polyfit(time, values, 1)
+        analysis_values = values - np.polyval(coeffs, time)
+
+    if np.std(analysis_values) == 0:
+        return {
+            'ar1': np.nan,
+            'dw_statistic': np.nan,
+            'is_independent': None,
+            'recommendation': '序列方差为零，无法判断时间独立性。',
+            'detrended': detrend,
+        }
+
     # AR1 自相关系数
-    ar1 = np.corrcoef(values[:-1], values[1:])[0, 1]
+    ar1 = np.corrcoef(analysis_values[:-1], analysis_values[1:])[0, 1]
 
     # Durbin-Watson 统计量 (2=独立, 0=正自相关, 4=负自相关)
-    residuals = values - np.mean(values)
-    dw = np.sum(np.diff(residuals) ** 2) / np.sum(residuals ** 2)
+    residuals = analysis_values - np.mean(analysis_values)
+    denominator = np.sum(residuals ** 2)
+    dw = np.sum(np.diff(residuals) ** 2) / denominator if denominator > 0 else np.nan
 
     # 判断：DW 接近 2 且 |AR1| < 0.3 为独立
     is_independent = (abs(dw - 2) < 0.5) and (abs(ar1) < 0.3)
 
+    block_length = 1
     if is_independent:
         recommendation = '时间独立性满足，可使用普通 Bootstrap'
     else:
-        block_length = int(1 / (1 - ar1)) if ar1 > 0 else 1
+        block_length = int(np.ceil((1 + ar1) / (1 - ar1))) if 0 < ar1 < 1 else 1
+        block_length = max(1, min(block_length, max(1, n // 2)))
         recommendation = (
             f'时间独立性不满足 (AR1={ar1:.3f}, DW={dw:.3f})。'
             f'建议使用块 Bootstrap，块长 ≈ {block_length}'
@@ -135,14 +169,16 @@ def check_temporal_independence(
         'ar1': ar1,
         'dw_statistic': dw,
         'is_independent': is_independent,
-        'block_length_suggestion': int(1 / (1 - ar1)) if ar1 > 0 else 1,
+        'block_length_suggestion': block_length if np.isfinite(ar1) else None,
         'recommendation': recommendation,
+        'detrended': detrend,
     }
 
 
 def check_spatial_independence(
     values: np.ndarray,
     coords: np.ndarray,
+    radius_km: Optional[float] = 200.0,
 ) -> Dict:
     """第七章 7.1 空间独立性假设检验。
 
@@ -161,11 +197,33 @@ def check_spatial_independence(
     Dict
         {'moran_i': float, 'p_value': float, 'is_independent': bool, 'recommendation': str}
     """
+    values = as_float_array(values, 'values', ndim=1, allow_nan=False)
+    coords = as_float_array(coords, 'coords', ndim=2, allow_nan=False)
+    if coords.shape[0] != len(values) or coords.shape[1] != 2:
+        raise ValueError('coords 必须为 (n_sites, 2)，且与 values 行数一致。')
+    if len(values) < 3:
+        return {'moran_i': np.nan, 'p_value': np.nan, 'is_independent': None,
+                'recommendation': '空间站点少于 3 个，无法稳定检验。'}
+    if radius_km is not None and (radius_km <= 0 or not np.isfinite(radius_km)):
+        raise ValueError('radius_km 必须为正的有限值或 None。')
+
+    # Approximate lon/lat as local kilometres for neighborhood construction.
+    lat0 = np.deg2rad(np.mean(coords[:, 0]))
+    metric_coords = np.column_stack([
+        coords[:, 1] * 111.32 * np.cos(lat0),
+        coords[:, 0] * 110.57,
+    ])
+
     try:
-        from libpysal.weights import DistanceBand
+        from libpysal.weights import DistanceBand, KNN
         from esda.moran import Moran
 
-        w = DistanceBand(coords, threshold=np.inf)
+        if radius_km is None:
+            w = KNN.from_array(metric_coords, k=min(4, len(values) - 1))
+        else:
+            w = DistanceBand(metric_coords, threshold=radius_km, binary=True, silence_warnings=True)
+            if getattr(w, 'islands', []):
+                w = KNN.from_array(metric_coords, k=min(4, len(values) - 1))
         w.transform = 'r'
         moran = Moran(values, w)
 
@@ -185,21 +243,19 @@ def check_spatial_independence(
             'is_independent': is_independent,
             'recommendation': recommendation,
             'test': 'Moran\'s I',
+            'radius_km': radius_km,
         }
 
     except ImportError:
-        # PySAL 不可用时用简化版本
+        # PySAL 不可用时使用明确标注的简化距离权重。
         n = len(values)
-        # 简化的 Moran's I 计算
         w = np.zeros((n, n))
         for i in range(n):
             for j in range(n):
                 if i != j:
-                    dist = np.sqrt(
-                        (coords[i, 0] - coords[j, 0]) ** 2
-                        + (coords[i, 1] - coords[j, 1]) ** 2
-                    )
-                    w[i, j] = 1 / dist if dist > 0 else 0
+                    dist = np.linalg.norm(metric_coords[i] - metric_coords[j])
+                    if radius_km is None or dist <= radius_km:
+                        w[i, j] = 1 / dist if dist > 0 else 0
 
         w_sum = w.sum()
         if w_sum == 0:
@@ -208,7 +264,11 @@ def check_spatial_independence(
 
         w_row = w.sum(axis=1)
         z = values - np.mean(values)
-        moran_i = (n / w_sum) * np.sum(w * np.outer(z, z)) / np.sum(z ** 2)
+        z_sum = np.sum(z ** 2)
+        if z_sum == 0:
+            return {'moran_i': np.nan, 'p_value': np.nan, 'is_independent': None,
+                    'recommendation': 'values 方差为零，无法计算 Moran\'s I。'}
+        moran_i = (n / w_sum) * np.sum(w * np.outer(z, z)) / z_sum
 
         is_independent = abs(moran_i) < 0.3
 
@@ -219,6 +279,7 @@ def check_spatial_independence(
             'recommendation': 'PySAL 不可用，使用简化 Moran\'s I。'
                               + ('空间独立性满足' if is_independent else '建议空间聚类后再合成'),
             'test': 'simplified Moran\'s I',
+            'radius_km': radius_km,
         }
 
 
@@ -239,26 +300,28 @@ def check_sample_size(n: int, method: str = 'bca') -> Dict:
     Dict
         {'sufficient': bool, 'n': int, 'recommendation': str, 'alternative': str or None}
     """
+    if n < 1:
+        raise ValueError('n 必须为正整数。')
     if method == 'bca':
         if n >= 30:
             return {
                 'sufficient': True,
                 'n': n,
-                'recommendation': '样本量充分 (n≥30)，BCa 渐近正态',
+                'recommendation': '样本量相对有利，但 BCa 稳定性仍取决于统计量和分布。',
                 'alternative': None,
             }
         elif n >= 20:
             return {
                 'sufficient': True,
                 'n': n,
-                'recommendation': '样本量达到 BCa 最低要求 (n≥20)，但建议报告样本量限制',
+                'recommendation': '样本量较小；BCa 加速因子可能不稳定，应报告敏感性分析。',
                 'alternative': None,
             }
         else:
             return {
                 'sufficient': False,
                 'n': n,
-                'recommendation': '样本量不足 (n<20)，BCa 加速因子可能不稳定',
+                'recommendation': '样本量很小；不要把 BCa 结果当作稳定推断，应考虑 percentile 或模型方法。',
                 'alternative': '改用百分位法 (percentile) 并明确报告样本量限制',
             }
     else:
@@ -283,7 +346,8 @@ def block_bootstrap(
     statistic: Callable,
     block_length: int,
     n_resamples: int = 10000,
-    method: str = 'BCa',
+    method: str = 'percentile',
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """第七章 7.1 块 Bootstrap：应对时间自相关。
 
@@ -309,31 +373,48 @@ def block_bootstrap(
     Dict
         {'statistic': float, 'ci_lower': float, 'ci_upper': float, 'block_length': int}
     """
-    n = len(data)
-    n_blocks = n // block_length
-
-    # 生成块 Bootstrap 样本
-    boot_stats = np.zeros(n_resamples)
+    values = as_float_array(data, 'data', ndim=1, allow_nan=False, min_size=4)
+    n = len(values)
+    if block_length < 1 or block_length > n:
+        raise ValueError('block_length 必须位于 1 和 n 之间。')
+    if n_resamples < 100:
+        raise ValueError('n_resamples 至少为 100。')
+    method_requested = method.lower()
+    if method_requested not in {'percentile', 'basic', 'bca'}:
+        raise ValueError("method 须为 'percentile'/'basic'/'bca'。")
+    if method_requested == 'bca':
+        warnings.warn(
+            '当前实现对相关数据不宣称精确 BCa；改用 moving-block percentile 区间。',
+            RuntimeWarning,
+        )
+    rng = get_rng(random_state)
+    n_blocks = int(np.ceil(n / block_length))
+    boot_stats = np.empty(n_resamples, dtype=float)
     for i in range(n_resamples):
-        # 随机选择块起点
-        block_starts = np.random.randint(0, n - block_length + 1, size=n_blocks)
-        # 拼接块
+        starts = rng.integers(0, n, size=n_blocks)
         resampled = np.concatenate([
-            data[s:s + block_length] for s in block_starts
-        ])
+            values[(start + np.arange(block_length)) % n] for start in starts
+        ])[:n]
         boot_stats[i] = statistic(resampled)
 
-    point_estimate = statistic(data)
-    ci_lower = np.percentile(boot_stats, 2.5)
-    ci_upper = np.percentile(boot_stats, 97.5)
+    if not np.all(np.isfinite(boot_stats)):
+        raise ValueError('block bootstrap 统计量产生了非有限值。')
+    point_estimate = float(statistic(values))
+    q_low, q_high = np.percentile(boot_stats, [2.5, 97.5])
+    if method_requested == 'basic':
+        ci_lower, ci_upper = 2 * point_estimate - q_high, 2 * point_estimate - q_low
+    else:
+        ci_lower, ci_upper = q_low, q_high
 
     return {
         'statistic': point_estimate,
-        'ci_lower': ci_lower,
-        'ci_upper': ci_upper,
+        'ci_lower': float(ci_lower),
+        'ci_upper': float(ci_upper),
         'block_length': block_length,
         'n_resamples': n_resamples,
-        'method': f'block {method}',
+        'method': f'moving_block_{"percentile" if method_requested == "bca" else method_requested}',
+        'requested_method': method_requested,
+        'random_state': random_state if isinstance(random_state, int) else None,
     }
 
 
@@ -363,33 +444,30 @@ def leave_one_out_validation(
     Dict
         {'full': np.ndarray, 'leave_one_out': dict, 'max_diff': float, 'stable': bool}
     """
+    records = as_float_array(records, 'records', ndim=2)
+    age_ensembles = as_float_array(age_ensembles, 'age_ensembles', ndim=2, allow_nan=False)
+    if age_ensembles.shape[1] != records.shape[1]:
+        raise ValueError('age_ensembles 与 records 的样本维度必须一致。')
     n_sites = records.shape[0]
+    n_eval = min(max(1, n_members), age_ensembles.shape[0])
 
-    # 完整合成
-    full_result = composite_func(
-        age_ensembles[0], records
-    )
+    full_members = [composite_func(age_ensembles[m], records) for m in range(n_eval)]
+    full_result = np.nanmedian(np.asarray(full_members), axis=0)
 
-    # 逐一剔除
     loo_results = {}
+    diffs = []
     for i in range(n_sites):
         mask = np.ones(n_sites, dtype=bool)
         mask[i] = False
-        loo_records = records[mask]
-        loo_results[f'site_{i}_removed'] = composite_func(
-            age_ensembles[0], loo_records
-        )
-
-    # 计算最大差异
-    diffs = []
-    for key, val in loo_results.items():
-        if len(val) == len(full_result):
-            diffs.append(np.max(np.abs(val - full_result)))
+        loo_members = [composite_func(age_ensembles[m], records[mask]) for m in range(n_eval)]
+        loo_result = np.nanmedian(np.asarray(loo_members), axis=0)
+        loo_results[f'site_{i}_removed'] = loo_result
+        if len(loo_result) == len(full_result):
+            diffs.append(np.nanmax(np.abs(loo_result - full_result)))
     max_diff = max(diffs) if diffs else np.nan
 
-    # 稳定性判断：最大差异 < 完整合成标准差的 50%
-    full_std = np.std(full_result)
-    stable = max_diff < 0.5 * full_std if not np.isnan(max_diff) else None
+    full_std = np.nanstd(full_result)
+    stable = bool(max_diff < 0.5 * full_std) if np.isfinite(max_diff) and full_std > 0 else None
 
     return {
         'full': full_result,
@@ -397,6 +475,7 @@ def leave_one_out_validation(
         'max_diff': max_diff,
         'stable': stable,
         'n_sites': n_sites,
+        'n_members_evaluated': n_eval,
     }
 
 
@@ -455,10 +534,11 @@ def propagate_three_layer_uncertainty(
     sample_data: np.ndarray,
     composite_func: Callable,
     n_members: int = 500,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """第七章 7.2 三层不确定性传播：年龄+校准+采样联合传播。
 
-    - 年龄不确定性：从 BAM/Bacon 后验分布整体采样完整年龄-深度曲线（保持地层单调性）
+    - 年龄不确定性：从外部年代模型后验整体采样完整年龄-深度曲线（保持地层单调性）
     - 校准不确定性：代理-气候校准残差作为独立正态噪声，标准差来自 RMSEP
     - 采样不确定性：Bootstrap 重采样自然传播
 
@@ -481,8 +561,18 @@ def propagate_three_layer_uncertainty(
         {'ensembles': np.ndarray (n_members, n_timebins),
          'uncertainty_band': dict, 'n_members': int, 'layers': list}
     """
+    sample_data = as_float_array(sample_data, 'sample_data', ndim=2)
+    age_ensembles = as_float_array(age_ensembles, 'age_ensembles', ndim=2, allow_nan=False)
+    calibration_errors = as_float_array(calibration_errors, 'calibration_errors', ndim=1, allow_nan=False)
+    if age_ensembles.shape[1] != sample_data.shape[1]:
+        raise ValueError('age_ensembles 与 sample_data 的样本维度必须一致。')
+    if len(calibration_errors) != sample_data.shape[0] or np.any(calibration_errors < 0):
+        raise ValueError('calibration_errors 必须按站点提供且非负。')
+    if n_members < 2:
+        raise ValueError('n_members 至少为 2。')
     n_sites = sample_data.shape[0]
     n_ensemble_pool = age_ensembles.shape[0]
+    rng = get_rng(random_state)
     ensembles = []
 
     for i in range(n_members):
@@ -490,13 +580,13 @@ def propagate_three_layer_uncertainty(
         ages = age_ensembles[i % n_ensemble_pool]
 
         # 2. 校准层：添加校准残差正态噪声
-        calib_noise = np.random.normal(
+        calib_noise = rng.normal(
             0, calibration_errors[:, np.newaxis], size=sample_data.shape
         )
         calibrated = sample_data + calib_noise
 
         # 3. 采样层：Bootstrap 重采样（对点位重采样）
-        boot_indices = np.random.choice(n_sites, size=n_sites, replace=True)
+        boot_indices = rng.choice(n_sites, size=n_sites, replace=True)
         boot_data = calibrated[boot_indices]
 
         # 执行合成
@@ -518,6 +608,7 @@ def propagate_three_layer_uncertainty(
         'n_members': n_members,
         'layers': ['age', 'calibration', 'sampling'],
         'method': 'three-layer Monte Carlo',
+        'random_state': random_state if isinstance(random_state, int) else None,
     }
 
 
@@ -549,14 +640,17 @@ def dual_indicator_check(
         {'result_a': any, 'result_b': any, 'consistent': bool or None, 'note': str}
     """
     # 构建两套指标
-    from scenarios import build_indicators
+    try:
+        from .scenarios import build_indicators
+    except ImportError:  # pragma: no cover
+        from scenarios import build_indicators
 
     indicators_a = build_indicators(data, indicator_set_a)
     indicators_b = build_indicators(data, indicator_set_b)
 
     # 分别分析
-    result_a = analysis_func(indicators_a)
-    result_b = analysis_func(indicators_b)
+    result_a = analysis_func(indicators_a['indicators'])
+    result_b = analysis_func(indicators_b['indicators'])
 
     # 一致性判断（简化：若结果为数值则比较方向）
     consistent = None
@@ -569,5 +663,7 @@ def dual_indicator_check(
         'result_b': result_b,
         'consistent': consistent,
         'note': 'Izdebski 2022 验证策略：双指标系统稳健性检验。'
-                '两套独立指标结论一致则增强结论可信度。',
+                '两套独立指标结论一致只能作为一致性证据，不能单独证明因果关系。',
+        'coverage_a': indicators_a.get('coverage'),
+        'coverage_b': indicators_b.get('coverage'),
     }

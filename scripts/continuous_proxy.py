@@ -15,11 +15,28 @@
 - Hedges 1999 [6]: 校准模型验证中的效应量
 """
 
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
+
+try:
+    from ._utils import (
+        as_float_array,
+        get_rng,
+        interpolate_no_extrapolation,
+        normalize_weights,
+        weighted_nanmean,
+    )
+except ImportError:  # pragma: no cover - supports direct script imports
+    from _utils import (
+        as_float_array,
+        get_rng,
+        interpolate_no_extrapolation,
+        normalize_weights,
+        weighted_nanmean,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -95,35 +112,45 @@ def standardize_continuous_proxy(
     Dict
         {'standardized': np.ndarray, 'method': str, 'params': dict}
     """
-    arr = np.asarray(values, dtype=float)
+    arr = as_float_array(values, 'values', ndim=1)
 
     # 提取基准子集
-    if baseline_period is not None and ages is not None:
-        ages = np.asarray(ages)
+    if baseline_period is not None:
+        if ages is None:
+            raise ValueError('使用 baseline_period 时必须提供 ages。')
+        ages = as_float_array(ages, 'ages', ndim=1, allow_nan=False)
+        if len(ages) != len(arr):
+            raise ValueError('ages 必须与 values 长度一致。')
         mask = (ages >= baseline_period[0]) & (ages <= baseline_period[1])
         baseline_data = arr[mask]
+        if not np.any(np.isfinite(baseline_data)):
+            raise ValueError('baseline_period 内没有有效观测。')
     else:
         baseline_data = arr
 
     if method == 'zscore':
         mu = np.nanmean(baseline_data)
         sigma = np.nanstd(baseline_data)
-        if sigma == 0:
-            sigma = 1.0
+        if not np.isfinite(sigma) or sigma == 0:
+            raise ValueError('z-score 基准标准差为零或非有限值。')
         standardized = (arr - mu) / sigma
         params = {'mean': mu, 'std': sigma}
 
     elif method == 'minmax':
         lo = np.nanmin(baseline_data)
         hi = np.nanmax(baseline_data)
-        rng = hi - lo if hi != lo else 1.0
+        if hi == lo:
+            raise ValueError('minmax 基准范围为零。')
+        rng = hi - lo
         standardized = (arr - lo) / rng
         params = {'min': lo, 'max': hi}
 
     elif method == 'robust':
         med = np.nanmedian(baseline_data)
         q1, q3 = np.nanpercentile(baseline_data, [25, 75])
-        iqr = q3 - q1 if q3 != q1 else 1.0
+        if q3 == q1:
+            raise ValueError('robust 标准化的 IQR 为零。')
+        iqr = q3 - q1
         standardized = (arr - med) / iqr
         params = {'median': med, 'iqr': iqr, 'q1': q1, 'q3': q3}
 
@@ -165,24 +192,31 @@ def calibrate_continuous_proxy(
         {'calibrated': np.ndarray, 'slope': float, 'intercept': float,
          'r2': float, 'rmsep': float, 'method': str, 'regression': str}
     """
-    x = np.asarray(calibration_x, dtype=float)
-    y = np.asarray(calibration_y, dtype=float)
-    proxy = np.asarray(proxy_values, dtype=float)
+    x = as_float_array(calibration_x, 'calibration_x', ndim=1, allow_nan=False, min_size=3)
+    y = as_float_array(calibration_y, 'calibration_y', ndim=1, allow_nan=False, min_size=3)
+    proxy = as_float_array(proxy_values, 'proxy_values', ndim=1)
+    if len(x) != len(y):
+        raise ValueError('calibration_x 与 calibration_y 长度必须一致。')
+    if np.unique(x).size < 2:
+        raise ValueError('calibration_x 至少需要两个不同值。')
+    coeffs = None
 
     if regression == 'ols':
         if method == 'linear':
             slope, intercept, r, p, se = sp_stats.linregress(x, y)
         elif method == 'polynomial':
             coeffs = np.polyfit(x, y, 2)
-            slope = coeffs[0]
-            intercept = coeffs[2]
-            r = np.corrcoef(x, y)[0, 1]
+            slope = np.nan
+            intercept = np.nan
+            r = np.nan
         else:
             raise ValueError(f"method 须为 'linear'/'polynomial'")
     elif regression == 'sma':
         # 标准化主轴回归 (Standardized Major Axis)
         # slope_sma = sign(r) * (sy/sx)
         sx, sy = np.std(x, ddof=1), np.std(y, ddof=1)
+        if sx == 0 or sy == 0:
+            raise ValueError('SMA 回归要求 x 和 y 都有非零方差。')
         r = np.corrcoef(x, y)[0, 1]
         slope = np.sign(r) * (sy / sx)
         intercept = np.mean(y) - slope * np.mean(x)
@@ -198,7 +232,9 @@ def calibrate_continuous_proxy(
     # 校准集 RMSEP
     predicted = slope * x + intercept if method == 'linear' or regression == 'sma' else np.polyval(coeffs, x)
     rmsep_val = np.sqrt(np.mean((predicted - y) ** 2))
-    r2 = r ** 2
+    ss_res = np.sum((predicted - y) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
     return {
         'calibrated': calibrated,
@@ -208,17 +244,19 @@ def calibrate_continuous_proxy(
         'rmsep': float(rmsep_val),
         'method': method,
         'regression': regression,
+        'coefficients': coeffs.tolist() if coeffs is not None else None,
     }
 
 
 def composite_continuous_proxy(
-    site_values: np.ndarray,
-    site_ages: np.ndarray,
+    site_values: Union[np.ndarray, Sequence[np.ndarray]],
+    site_ages: Union[np.ndarray, Sequence[np.ndarray]],
     time_grid: np.ndarray,
     weights: Optional[np.ndarray] = None,
-    age_ensembles: Optional[np.ndarray] = None,
+    age_ensembles: Optional[Union[np.ndarray, Sequence[np.ndarray]]] = None,
     proxy_errors: Optional[np.ndarray] = None,
     n_members: int = 500,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """连续值代理多站点合成（含年龄不确定性传播）。
 
@@ -249,74 +287,106 @@ def composite_continuous_proxy(
         {'composite': np.ndarray (n_bins,), 'ensembles': np.ndarray or None,
          'uncertainty_band': dict or None, 'n_sites': int, 'n_members': int}
     """
-    n_sites, n_depths = site_values.shape
+    grid = as_float_array(time_grid, 'time_grid', ndim=1, allow_nan=False)
 
-    if weights is None:
-        weights = np.ones(n_sites) / n_sites
+    if isinstance(site_values, np.ndarray) and site_values.ndim == 2:
+        values_list = [as_float_array(row, f'site_values[{i}]', ndim=1) for i, row in enumerate(site_values)]
     else:
-        weights = weights / weights.sum()
+        values_list = [as_float_array(row, f'site_values[{i}]', ndim=1) for i, row in enumerate(site_values)]
+    n_sites = len(values_list)
+    if n_sites == 0:
+        raise ValueError('至少需要一个站点。')
 
-    # 单次合成（无不确定性传播）
-    if age_ensembles is None and proxy_errors is None:
-        resampled = np.zeros((n_sites, len(time_grid)))
+    if isinstance(site_ages, np.ndarray) and site_ages.ndim == 1:
+        ages_list = [as_float_array(site_ages, 'site_ages', ndim=1, allow_nan=False)] * n_sites
+    elif isinstance(site_ages, np.ndarray) and site_ages.ndim == 2:
+        if site_ages.shape[0] != n_sites:
+            raise ValueError('site_ages 的站点维度不匹配。')
+        ages_list = [as_float_array(row, f'site_ages[{i}]', ndim=1, allow_nan=False) for i, row in enumerate(site_ages)]
+    else:
+        ages_list = [as_float_array(row, f'site_ages[{i}]', ndim=1, allow_nan=False) for i, row in enumerate(site_ages)]
+    if len(ages_list) != n_sites:
+        raise ValueError('site_values 与 site_ages 的站点数量必须一致。')
+    for i, (values, ages) in enumerate(zip(values_list, ages_list)):
+        if len(values) != len(ages):
+            raise ValueError(f'站点 {i} 的 values 与 ages 长度不一致。')
+
+    weights_arr = normalize_weights(weights, n_sites)
+    if proxy_errors is None:
+        errors = np.zeros(n_sites)
+    else:
+        errors = as_float_array(proxy_errors, 'proxy_errors', ndim=1, allow_nan=False)
+        if len(errors) != n_sites or np.any(errors < 0):
+            raise ValueError('proxy_errors 必须按站点提供且非负。')
+
+    # Normalize shared or per-site age ensembles without padding ragged records.
+    age_members = None
+    if age_ensembles is not None:
+        if isinstance(age_ensembles, np.ndarray) and age_ensembles.ndim == 2:
+            shared = as_float_array(age_ensembles, 'age_ensembles', ndim=2, allow_nan=False)
+            if any(len(ages) != shared.shape[1] for ages in ages_list):
+                raise ValueError('共享 age_ensembles 的样本维度必须匹配每个站点。')
+            age_members = [shared] * n_sites
+        elif isinstance(age_ensembles, np.ndarray) and age_ensembles.ndim == 3:
+            if age_ensembles.shape[0] != n_sites:
+                raise ValueError('逐站点 age_ensembles 的站点维度不匹配。')
+            age_members = [as_float_array(age_ensembles[i], f'age_ensembles[{i}]', ndim=2, allow_nan=False) for i in range(n_sites)]
+        else:
+            if len(age_ensembles) != n_sites:
+                raise ValueError('逐站点 age_ensembles 的站点数量不匹配。')
+            age_members = [as_float_array(v, f'age_ensembles[{i}]', ndim=2, allow_nan=False) for i, v in enumerate(age_ensembles)]
+            for i, (members, ages) in enumerate(zip(age_members, ages_list)):
+                if members.shape[1] != len(ages):
+                    raise ValueError(f'站点 {i} 的 age_ensembles 样本维度不匹配。')
+
+    rng = get_rng(random_state)
+    has_uncertainty = age_members is not None or np.any(errors > 0)
+
+    def make_member(member_index: int) -> np.ndarray:
+        resampled = np.full((n_sites, len(grid)), np.nan)
         for s in range(n_sites):
-            ages_s = site_ages if site_ages.ndim == 1 else site_ages[s]
-            resampled[s] = np.interp(time_grid, ages_s, site_values[s])
-        composite = np.nansum(resampled * weights[:, np.newaxis], axis=0)
+            ages_s = ages_list[s]
+            if age_members is not None:
+                pool = age_members[s]
+                ages_s = pool[member_index % pool.shape[0]]
+            values_s = values_list[s]
+            if errors[s] > 0:
+                values_s = values_s + rng.normal(0, errors[s], size=len(values_s))
+            resampled[s] = interpolate_no_extrapolation(
+                ages_s, values_s, grid, name=f'site_{s}'
+            )
+        return weighted_nanmean(resampled, weights_arr)
+
+    if not has_uncertainty:
+        composite = make_member(0)
         return {
-            'composite': composite, 'ensembles': None,
-            'uncertainty_band': None, 'n_sites': n_sites, 'n_members': 1,
+            'composite': composite,
+            'ensembles': None,
+            'uncertainty_band': None,
+            'n_sites': n_sites,
+            'n_members': 1,
+            'weights': weights_arr,
+            'extrapolation': 'nan',
         }
 
-    # 蒙特卡洛集合传播
-    age_ens = age_ensembles if age_ensembles is not None else site_ages[np.newaxis, :]
-    p_errs = proxy_errors if proxy_errors is not None else np.zeros(n_sites)
-    n_ens_pool = age_ens.shape[0]
-
-    ensembles = np.zeros((n_members, len(time_grid)))
-
-    for m in range(n_members):
-        # 采样一个年龄成员
-        ages_m = age_ens[m % n_ens_pool]
-        # 添加校准噪声
-        noise = np.random.normal(0, p_errs[:, np.newaxis], size=site_values.shape)
-        noisy_values = site_values + noise
-
-        resampled = np.zeros((n_sites, len(time_grid)))
-        for s in range(n_sites):
-            resampled[s] = np.interp(time_grid, ages_m, noisy_values[s])
-
-        ensembles[m] = np.nansum(resampled * weights[:, np.newaxis], axis=0)
-
-    # 如果年龄是各站独立的，需要逐站插值
-    if site_ages.ndim == 2 and age_ensembles is None:
-        ensembles_ind = np.zeros((n_members, len(time_grid)))
-        for m in range(n_members):
-            noise = np.random.normal(0, p_errs[:, np.newaxis], size=site_values.shape)
-            noisy = site_values + noise
-            resampled = np.zeros((n_sites, len(time_grid)))
-            for s in range(n_sites):
-                # 对每站添加年龄扰动
-                age_jitter = site_ages[s] + np.random.normal(
-                    0, np.std(np.diff(site_ages[s])) * 0.1, size=len(site_ages[s])
-                )
-                age_jitter = np.sort(age_jitter)
-                resampled[s] = np.interp(time_grid, age_jitter, noisy[s])
-            ensembles_ind[m] = np.nansum(resampled * weights[:, np.newaxis], axis=0)
-        ensembles = ensembles_ind
-
+    if n_members < 2:
+        raise ValueError('有不确定性传播时 n_members 至少为 2。')
+    ensembles = np.array([make_member(m) for m in range(n_members)])
     band = {
-        'lower': np.percentile(ensembles, 5, axis=0),
-        'median': np.percentile(ensembles, 50, axis=0),
-        'upper': np.percentile(ensembles, 95, axis=0),
+        'lower': np.nanpercentile(ensembles, 5, axis=0),
+        'median': np.nanpercentile(ensembles, 50, axis=0),
+        'upper': np.nanpercentile(ensembles, 95, axis=0),
+        'percentiles': (5, 50, 95),
     }
-
     return {
         'composite': band['median'],
         'ensembles': ensembles,
         'uncertainty_band': band,
         'n_sites': n_sites,
         'n_members': n_members,
+        'weights': weights_arr,
+        'random_state': random_state if isinstance(random_state, int) else None,
+        'extrapolation': 'nan',
     }
 
 
@@ -327,6 +397,7 @@ def propagate_continuous_uncertainty(
     time_grid: np.ndarray,
     composite_func: Optional[Callable] = None,
     n_members: int = 500,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """连续值代理三层不确定性传播（年龄+校准+采样）。
 
@@ -355,20 +426,30 @@ def propagate_continuous_uncertainty(
         {'ensembles': np.ndarray (n_members, n_bins),
          'uncertainty_band': dict, 'n_members': int, 'layers': list}
     """
-    n_ens_pool = age_ensembles.shape[0]
-    ensembles = np.zeros((n_members, len(time_grid)))
+    proxy_arr = as_float_array(proxy_values, 'proxy_values', ndim=1, allow_nan=False, min_size=2)
+    age_arr = as_float_array(age_ensembles, 'age_ensembles', ndim=2, allow_nan=False)
+    if age_arr.shape[1] != len(proxy_arr):
+        raise ValueError('age_ensembles 的样本维度必须与 proxy_values 一致。')
+    if calibration_error < 0 or not np.isfinite(calibration_error):
+        raise ValueError('calibration_error 必须为非负有限值。')
+    if n_members < 2:
+        raise ValueError('n_members 至少为 2。')
+    grid = as_float_array(time_grid, 'time_grid', ndim=1, allow_nan=False)
+    n_ens_pool = age_arr.shape[0]
+    rng = get_rng(random_state)
+    ensembles = np.full((n_members, len(grid)), np.nan)
 
     for i in range(n_members):
         # 1. 年龄层：采样一个年龄成员（保持地层单调性）
-        ages = age_ensembles[i % n_ens_pool]
+        ages = age_arr[i % n_ens_pool]
 
         # 2. 校准层：添加校准误差正态噪声
-        noise = np.random.normal(0, calibration_error, size=len(proxy_values))
-        noisy_values = proxy_values + noise
+        noise = rng.normal(0, calibration_error, size=len(proxy_arr))
+        noisy_values = proxy_arr + noise
 
         # 3. 采样层：Bootstrap 重采样（对深度点重采样）
-        n_depths = len(proxy_values)
-        boot_idx = np.random.choice(n_depths, size=n_depths, replace=True)
+        n_depths = len(proxy_arr)
+        boot_idx = rng.choice(n_depths, size=n_depths, replace=True)
         boot_ages = ages[boot_idx]
         boot_values = noisy_values[boot_idx]
         # 保持单调
@@ -378,9 +459,11 @@ def propagate_continuous_uncertainty(
 
         # 插值到统一网格
         if composite_func is not None:
-            ensembles[i] = composite_func(boot_ages, boot_values, time_grid)
+            ensembles[i] = composite_func(boot_ages, boot_values, grid)
         else:
-            ensembles[i] = np.interp(time_grid, boot_ages, boot_values)
+            ensembles[i] = interpolate_no_extrapolation(
+                boot_ages, boot_values, grid, name=f'member_{i}'
+            )
 
     band = {
         'lower': np.percentile(ensembles, 5, axis=0),
@@ -394,6 +477,7 @@ def propagate_continuous_uncertainty(
         'n_members': n_members,
         'layers': ['age', 'calibration', 'sampling'],
         'method': 'three-layer Monte Carlo (continuous proxy)',
+        'random_state': random_state if isinstance(random_state, int) else None,
     }
 
 
@@ -402,6 +486,7 @@ def cross_validate_calibration(
     climate_y: np.ndarray,
     calibration_func: Optional[Callable] = None,
     method: str = 'loocv',
+    n_splits: int = 5,
 ) -> Dict:
     """连续值代理校准模型交叉验证。
 
@@ -418,7 +503,10 @@ def cross_validate_calibration(
         校准函数，接受 (X_train, y_train) 返回模型对象。
         默认使用线性回归。
     method : str, optional
-        验证方法：'loocv' (留一, 默认) 或 'kfold'。
+        验证方法：'loocv' (留一, 默认)、'kfold' 或按时间顺序的
+        'timeseries'。时间序列优先使用 'timeseries'。
+    n_splits : int, optional
+        kfold/timeseries 的折数，默认 5。
 
     Returns
     -------
@@ -426,7 +514,13 @@ def cross_validate_calibration(
         {'predictions': np.ndarray, 'residuals': np.ndarray,
          'rmsep': float, 'r2': float, 'method': str}
     """
+    proxy_x = as_float_array(proxy_x, 'proxy_x', ndim=1, allow_nan=False)
+    climate_y = as_float_array(climate_y, 'climate_y', ndim=1, allow_nan=False)
+    if len(proxy_x) != len(climate_y):
+        raise ValueError('proxy_x 与 climate_y 长度必须一致。')
     n = len(proxy_x)
+    if n < 3:
+        raise ValueError('交叉验证至少需要三个样本。')
     predictions = np.zeros(n)
 
     if calibration_func is None:
@@ -445,19 +539,42 @@ def cross_validate_calibration(
             predictions[i] = model.predict(proxy_x[~mask])[0]
 
     elif method == 'kfold':
-        from sklearn.model_selection import KFold
-        kf = KFold(n_splits=min(5, n), shuffle=True, random_state=42)
+        try:
+            from sklearn.model_selection import KFold
+        except ImportError as exc:
+            raise ImportError(
+                'kfold 需要可选依赖 scikit-learn；请安装 requirements-optional.txt，'
+                '或使用 loocv/timeseries。'
+            ) from exc
+        kf = KFold(n_splits=min(max(2, n_splits), n), shuffle=False)
         for train_idx, test_idx in kf.split(proxy_x):
             model = calibration_func(proxy_x[train_idx], climate_y[train_idx])
             predictions[test_idx] = model.predict(proxy_x[test_idx])
 
-    else:
-        raise ValueError(f"method 须为 'loocv'/'kfold'")
+    elif method == 'timeseries':
+        try:
+            from sklearn.model_selection import TimeSeriesSplit
+        except ImportError as exc:
+            raise ImportError(
+                'timeseries 需要可选依赖 scikit-learn；请安装 requirements-optional.txt。'
+            ) from exc
+        n_split = min(max(2, n_splits), n - 1)
+        splitter = TimeSeriesSplit(n_splits=n_split)
+        for train_idx, test_idx in splitter.split(proxy_x):
+            model = calibration_func(proxy_x[train_idx], climate_y[train_idx])
+            predictions[test_idx] = model.predict(proxy_x[test_idx])
+        # The earliest observations cannot be scored without a training history.
+        first_scored = min(test_idx[0] for _, test_idx in splitter.split(proxy_x))
+        predictions[:first_scored] = np.nan
 
+    else:
+        raise ValueError("method 须为 'loocv'/'kfold'/'timeseries'")
+
+    valid = np.isfinite(predictions)
     residuals = climate_y - predictions
-    rmsep_val = np.sqrt(np.mean(residuals ** 2))
-    ss_res = np.sum(residuals ** 2)
-    ss_tot = np.sum((climate_y - np.mean(climate_y)) ** 2)
+    rmsep_val = np.sqrt(np.mean(residuals[valid] ** 2))
+    ss_res = np.sum(residuals[valid] ** 2)
+    ss_tot = np.sum((climate_y[valid] - np.mean(climate_y[valid])) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
     return {
@@ -467,6 +584,7 @@ def cross_validate_calibration(
         'r2': r2,
         'method': method,
         'n': n,
+        'n_scored': int(valid.sum()),
     }
 
 
@@ -475,6 +593,8 @@ def proxy_comparison(
     proxy_b_values: np.ndarray,
     ages: Optional[np.ndarray] = None,
     n_boot: int = 10000,
+    agreement_threshold: Optional[float] = None,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
 ) -> Dict:
     """双代理交叉验证：评估两个独立代理的一致性。
 
@@ -500,17 +620,20 @@ def proxy_comparison(
     """
     from scipy.stats import bootstrap
 
-    a = np.asarray(proxy_a_values, dtype=float)
-    b = np.asarray(proxy_b_values, dtype=float)
+    a = as_float_array(proxy_a_values, 'proxy_a_values', ndim=1)
+    b = as_float_array(proxy_b_values, 'proxy_b_values', ndim=1)
+    if len(a) != len(b):
+        raise ValueError('两个代理序列长度必须一致。')
+    valid = np.isfinite(a) & np.isfinite(b)
+    a, b = a[valid], b[valid]
+    if len(a) < 3:
+        raise ValueError('代理比较至少需要三个共同有限观测。')
 
     # Pearson 相关
     r, p = sp_stats.pearsonr(a, b)
 
     # Bootstrap 置信区间
-    def corr_stat(data, axis=None):
-        x, y = data[0], data[1]
-        if axis is None:
-            return np.corrcoef(x, y)[0, 1]
+    def corr_stat(x, y, axis=-1):
         mx = np.mean(x, axis=axis)
         my = np.mean(y, axis=axis)
         mx2 = np.mean(x * x, axis=axis)
@@ -519,21 +642,23 @@ def proxy_comparison(
         cov = mxy - mx * my
         sx = np.sqrt(mx2 - mx ** 2)
         sy = np.sqrt(my2 - my ** 2)
-        return cov / (sx * sy)
+        return np.divide(cov, sx * sy, out=np.full_like(cov, np.nan, dtype=float), where=(sx > 0) & (sy > 0))
 
     try:
         result = bootstrap(
             (a, b), statistic=corr_stat,
             n_resamples=n_boot, method='BCa',
             confidence_level=0.95, paired=True,
+            random_state=get_rng(random_state),
         )
         ci_lower = result.confidence_interval.low
         ci_upper = result.confidence_interval.high
-    except Exception:
-        ci_lower = ci_upper = np.nan
+    except Exception as exc:
+        raise ValueError(f'代理相关系数 bootstrap 失败：{exc}') from exc
 
-    agreement = (r > 0.5) and (ci_lower > 0) if not np.isnan(ci_lower) else None
     mean_diff = np.mean(a - b)
+    rmse = np.sqrt(np.mean((a - b) ** 2))
+    agreement = None if agreement_threshold is None else abs(mean_diff) <= agreement_threshold
 
     return {
         'correlation': float(r),
@@ -542,6 +667,8 @@ def proxy_comparison(
         'ci_upper': float(ci_upper),
         'agreement': agreement,
         'mean_diff': float(mean_diff),
-        'method': 'Pearson + BCa',
+        'rmse': float(rmse),
+        'method': 'paired Pearson association + BCa',
         'n_boot': n_boot,
+        'agreement_threshold': agreement_threshold,
     }
