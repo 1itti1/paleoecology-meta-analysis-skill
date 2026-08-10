@@ -57,7 +57,20 @@
 
 ## 快速开始
 
-在仓库根目录运行：
+请在仓库根目录运行。最常见的流程是：
+
+1. 安装核心依赖；
+2. 为每个 `site_id` × `proxy_id` 准备一条记录；
+3. 声明所有代理共同表示的 `target` 以及每个代理的 `direction`；
+4. 运行合成，并检查覆盖度、不确定性、代理一致性和逐代理剔除敏感性。
+
+首次使用时先安装核心依赖：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+下面第一个代码块是单通道 smoke test，异质多代理示例位于其后。
 
 ```python
 import numpy as np
@@ -105,6 +118,9 @@ perturbed = age_ensemble_from_errors(
 
 对于具有共同目标的异质代理，可使用明确的代理级工作流：
 
+可将下面代码保存为 `example.py`，然后运行 `python example.py`。示例使用内存
+中的合成数组；实际分析时请替换为经过审计的 `ages` 和 `values`。
+
 ```python
 import numpy as np
 
@@ -131,6 +147,26 @@ records = [
         "direction": "negative",
         "measurement_error": 0.2,
     },
+    {
+        "site_id": "core_B",
+        "proxy_id": "pollen",
+        "proxy_type": "taxa",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([11., 17., 23.]),
+        "direction": "positive",
+        "measurement_error": 0.5,
+    },
+    {
+        "site_id": "core_B",
+        "proxy_id": "charcoal",
+        "proxy_type": "continuous",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([7., 4., 2.]),
+        "direction": "negative",
+        "measurement_error": 0.2,
+    },
 ]
 
 result = multi_proxy_synthesis(
@@ -140,7 +176,30 @@ result = multi_proxy_synthesis(
     random_state=42,
 )
 loo = leave_one_proxy_out(records, np.array([0., 50., 100., 150., 200.]))
+
+print(result["composite"])
+print(result["uncertainty_band"])
+print(result["effective_site_count"])
+print(result["proxy_concordance"])
+print(loo["by_excluded_proxy"])
 ```
+
+最重要的输入字段如下：
+
+| 字段 | 含义 |
+|---|---|
+| `site_id` | 用于站点级重抽样的独立档案/剖面 |
+| `proxy_id` | 代理通道，例如 `pollen`、`charcoal` 或 `d13C` |
+| `target` | 共同合成目标；所有记录必须一致 |
+| `direction` | `positive` 或 `negative`，使转换后的数值方向一致 |
+| `ages`、`values` | 等长的原始数组；不同记录可以不等长 |
+| `age_ensembles` | 可选年代后验，形状为 `(members, samples)` |
+| `measurement_error` | 可选测量误差，可为原始单位下的标量或逐样品数组 |
+
+主要输出包括 `composite`、`uncertainty_band`、`effective_site_count`、
+`effective_proxy_count`、`proxy_concordance` 和 `by_excluded_proxy`。同一站点
+包含多个代理时仍只算一个区域重复单元，因为 bootstrap 单位是
+`site_cluster`。
 
 这是透明的共同目标证据合成，不是潜变量模型、REVEALS 或代理专属前向模型。
 不同目标必须分开分析，再在共同时间框架下比较。

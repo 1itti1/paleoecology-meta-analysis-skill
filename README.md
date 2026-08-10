@@ -67,7 +67,22 @@ contract while retaining archive-specific assumptions.
 
 ## Quick start
 
-Run from the repository root:
+Run from the repository root. The usual workflow is:
+
+1. install the core dependencies;
+2. prepare one record for each `site_id` × `proxy_id`;
+3. declare a common `target` and the expected `direction` of every proxy;
+4. run the synthesis and inspect coverage, uncertainty, concordance, and
+   leave-one-proxy-out sensitivity.
+
+Install the core dependencies once:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+The first code block below is a small single-channel smoke test. The
+heterogeneous multi-proxy example follows it.
 
 ```python
 import numpy as np
@@ -119,6 +134,9 @@ perturbed = age_ensemble_from_errors(
 For heterogeneous proxies with a shared target, use the explicit proxy-level
 workflow:
 
+Copy the following block into `example.py` and run `python example.py`. It uses
+synthetic in-memory arrays; replace `ages` and `values` with your audited data.
+
 ```python
 import numpy as np
 
@@ -145,6 +163,26 @@ records = [
         "direction": "negative",
         "measurement_error": 0.2,
     },
+    {
+        "site_id": "core_B",
+        "proxy_id": "pollen",
+        "proxy_type": "taxa",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([11., 17., 23.]),
+        "direction": "positive",
+        "measurement_error": 0.5,
+    },
+    {
+        "site_id": "core_B",
+        "proxy_id": "charcoal",
+        "proxy_type": "continuous",
+        "target": "vegetation_change",
+        "ages": np.array([0., 100., 200.]),
+        "values": np.array([7., 4., 2.]),
+        "direction": "negative",
+        "measurement_error": 0.2,
+    },
 ]
 
 result = multi_proxy_synthesis(
@@ -154,7 +192,30 @@ result = multi_proxy_synthesis(
     random_state=42,
 )
 loo = leave_one_proxy_out(records, np.array([0., 50., 100., 150., 200.]))
+
+print(result["composite"])
+print(result["uncertainty_band"])
+print(result["effective_site_count"])
+print(result["proxy_concordance"])
+print(loo["by_excluded_proxy"])
 ```
+
+The most important input fields are:
+
+| Field | Meaning |
+|---|---|
+| `site_id` | Independent archive/core used for site-level resampling |
+| `proxy_id` | Proxy channel, such as `pollen`, `charcoal`, or `d13C` |
+| `target` | Common construct being synthesized; it must match across records |
+| `direction` | `positive` or `negative`, so larger transformed values have one meaning |
+| `ages`, `values` | Equal-length raw arrays; irregular lengths are allowed across records |
+| `age_ensembles` | Optional chronology posterior with shape `(members, samples)` |
+| `measurement_error` | Optional scalar or sample-level error in the raw proxy unit |
+
+The main outputs are `composite`, `uncertainty_band`, `effective_site_count`,
+`effective_proxy_count`, `proxy_concordance`, and `by_excluded_proxy`. A site
+with several proxies is still one regional replicate because the bootstrap unit
+is `site_cluster`.
 
 This is a transparent common-target evidence synthesis, not a latent-variable,
 REVEALS, or proxy-specific forward model. Different targets must be analyzed
