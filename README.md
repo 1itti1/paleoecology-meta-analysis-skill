@@ -10,6 +10,65 @@ contract while retaining archive-specific assumptions.
 > not a substitute for archive-specific age modelling, proxy ecology, or
 > expert review.
 
+This checkout includes unreleased EasyMeta-inspired analysis contracts and
+numerical corrections. See the plan-first example and migration notes below.
+EasyMeta is not a runtime dependency.
+
+## Plan-first usage
+
+The recommended entry point is now `run_analysis()`: declare the quantity to
+estimate, the analysis scale, independent replication and dependence before
+running a numerical method. From the repository root, after installing
+`requirements.txt`, this complete synthetic example uses the bundled plan:
+
+```python
+import json
+import numpy as np
+from scripts.analysis_contracts import run_analysis
+
+with open("assets/analysis_plan.json", encoding="utf-8") as stream:
+    plan = json.load(stream)
+
+records = [
+    dict(site_id="core_A", proxy_id="wetness_index", target="hydroclimate",
+         ages=[0., 100., 200.], values=[1., 2., 4.], age_unit="cal_year_BP",
+         direction="positive", source="synthetic example"),
+    dict(site_id="core_B", proxy_id="wetness_index", target="hydroclimate",
+         ages=[0., 100., 200.], values=[2., 3., 5.], age_unit="cal_year_BP",
+         direction="positive", source="synthetic example"),
+]
+result = run_analysis(plan, records, time_grid=np.array([50., 150.]),
+                      n_members=200, random_state=42)
+print(result["analysis_route"]["route"])
+print(result["composite"])
+print(result["provenance"]["input_sha256"])
+```
+
+Change the plan's `design` and matching `data_level` for calibration, paired
+prediction validation, event-window comparison, or study-effect Meta analysis.
+Unsupported dependence or an explicit non-pooling decision returns
+`status="not_fitted"` with a reason. Repeated study effects and incompatible
+scales are checked against the actual data before ordinary Meta pooling.
+The [contract reference](references/analysis_contracts.md) describes all fields,
+study-effect rows, and the input/code/output SHA-256 manifest.
+
+## Migration notes for the corrected calculations
+
+- `effect_size_bca(..., effect_type="lnrr")` now estimates
+  `log(mean(T)/mean(C))`. Choose `paired_log_ratio` explicitly for
+  `mean(log(T/C))`, and declare the paired/independent design.
+- Proxy prediction validation applies calibration first and defaults to bias
+  and RMSEP in the observation unit, instead of selecting a ratio from numeric
+  positivity.
+- Chronology groups are independent by default; sharing posterior members
+  requires an explicitly aligned `chronology_group`.
+- Measurement-error standardization, Python KH inference and Egger coefficient
+  extraction have numerical reference tests. Recompute affected old results.
+- Event comparisons use block intervals; multiple windows no longer vote on
+  P values. `time_direction="BP"` handles older ages being numerically larger.
+- Single-record continuous uncertainty defaults to fixed sample positions.
+  An IID pairs bootstrap must be explicitly selected.
+
 ## What changed in 2.3
 
 - Added a proxy-level contract and a conservative heterogeneous-proxy
@@ -136,6 +195,9 @@ workflow:
 
 Copy the following block into `example.py` and run `python example.py`. It uses
 synthetic in-memory arrays; replace `ages` and `values` with your audited data.
+The two channels are hypothetical wetness/dryness indices with a declared
+common target. This is not a rule that pollen, charcoal or other raw proxies
+have interchangeable ecological meaning.
 
 ```python
 import numpy as np
@@ -145,9 +207,9 @@ from scripts.multi_proxy import multi_proxy_synthesis, leave_one_proxy_out
 records = [
     {
         "site_id": "core_A",
-        "proxy_id": "pollen",
-        "proxy_type": "taxa",
-        "target": "vegetation_change",
+        "proxy_id": "wetness_index",
+        "proxy_type": "continuous",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([12., 18., 24.]),
         "direction": "positive",
@@ -155,9 +217,9 @@ records = [
     },
     {
         "site_id": "core_A",
-        "proxy_id": "charcoal",
+        "proxy_id": "dryness_index",
         "proxy_type": "continuous",
-        "target": "vegetation_change",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([8., 5., 2.]),
         "direction": "negative",
@@ -165,9 +227,9 @@ records = [
     },
     {
         "site_id": "core_B",
-        "proxy_id": "pollen",
-        "proxy_type": "taxa",
-        "target": "vegetation_change",
+        "proxy_id": "wetness_index",
+        "proxy_type": "continuous",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([11., 17., 23.]),
         "direction": "positive",
@@ -175,9 +237,9 @@ records = [
     },
     {
         "site_id": "core_B",
-        "proxy_id": "charcoal",
+        "proxy_id": "dryness_index",
         "proxy_type": "continuous",
-        "target": "vegetation_change",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([7., 4., 2.]),
         "direction": "negative",
@@ -191,7 +253,10 @@ result = multi_proxy_synthesis(
     n_members=500,
     random_state=42,
 )
-loo = leave_one_proxy_out(records, np.array([0., 50., 100., 150., 200.]))
+loo = leave_one_proxy_out(
+    records, np.array([0., 50., 100., 150., 200.]),
+    n_members=500, random_state=42,
+)
 
 print(result["composite"])
 print(result["uncertainty_band"])
@@ -240,6 +305,8 @@ targets or silently infer the direction of a proxy response.
 | Module | Purpose |
 |---|---|
 | `scripts/preprocessing.py` | Age-ensemble consumption, perturbation sensitivity, standardization, safe interpolation, naming, bias documentation |
+| `scripts/analysis_contracts.py` | Executable routing, staged effect validation, independent-cluster checks, guarded dispatch |
+| `scripts/provenance.py` | Input, parameter, code, source-file and output fingerprints; package versions |
 | `scripts/synthesis.py` | SCC, DCC, CPS, PAI, descriptive GAM/LOESS, Monte Carlo ensembles |
 | `scripts/continuous_proxy.py` | Calibration, ragged-site synthesis, uncertainty, time-aware validation, paired comparison |
 | `scripts/multi_proxy.py` | Proxy-level validation, target/direction harmonization, site-clustered synthesis, correlated error propagation, concordance, leave-one-proxy-out |

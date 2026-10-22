@@ -47,9 +47,12 @@ causal attribution. Different targets, such as hydroclimate and human activity,
 must not be pooled into one composite.
 
 The optional measurement-correlation argument only propagates correlations in
-standardized measurement-error draws within a site. It does not recover shared
-age-depth covariance, transport covariance, preservation covariance, or process
-covariance. For those estimands use an explicit multivariate or hierarchical
+standardized measurement-error draws within a site on the aligned grid. Errors
+are independent between grid bins; the result labels this conditional model.
+It does not recover measurement/interpolation-error covariance through time,
+transport covariance, preservation covariance, or process covariance. Shared
+age-depth covariance is retained only through supplied, identity-aligned
+posterior members in an explicit chronology group. For richer covariance targets use an explicit multivariate or hierarchical
 model and report its likelihood, priors, covariance structure, and sensitivity.
 Always inspect proxy concordance and leave-one-proxy-out sensitivity before
 interpreting a composite.

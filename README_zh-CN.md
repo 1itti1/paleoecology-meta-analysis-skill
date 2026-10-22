@@ -8,6 +8,59 @@
 > 开发版本：2.3.0。本项目是可复现的分析起点，不替代档案专属年代模型、
 > 代理生态学判断或专家审查。
 
+本次工作版本新增了借鉴 EasyMeta 的分析契约与数值修正，尚未发布新版本。
+EasyMeta 无需另外安装；本 skill 已包含所需的精简路由和来源记录实现。
+
+## 推荐用法：先声明分析目标，再运行
+
+推荐入口为 `run_analysis()`：先声明要估计什么、采用什么尺度、独立重复单位
+是什么以及依赖来自哪里。在仓库根目录安装 `requirements.txt` 后，可以直接
+运行下面的完整合成数据示例：
+
+```python
+import json
+import numpy as np
+from scripts.analysis_contracts import run_analysis
+
+with open("assets/analysis_plan.json", encoding="utf-8") as stream:
+    plan = json.load(stream)
+
+records = [
+    dict(site_id="core_A", proxy_id="wetness_index", target="hydroclimate",
+         ages=[0., 100., 200.], values=[1., 2., 4.], age_unit="cal_year_BP",
+         direction="positive", source="synthetic example"),
+    dict(site_id="core_B", proxy_id="wetness_index", target="hydroclimate",
+         ages=[0., 100., 200.], values=[2., 3., 5.], age_unit="cal_year_BP",
+         direction="positive", source="synthetic example"),
+]
+result = run_analysis(plan, records, time_grid=np.array([50., 150.]),
+                      n_members=200, random_state=42)
+print(result["analysis_route"]["route"])
+print(result["composite"])
+print(result["provenance"]["input_sha256"])
+```
+
+若要做校准、配对预测验证、事件窗口比较或研究级效应量 Meta，修改计划中的
+`design` 及匹配的 `data_level`。依赖结构超出已实现方法或明确不宜合并时，
+返回 `status="not_fitted"` 和原因。普通 Meta 运行前，还会实际检查重复研究、
+独立簇和效应尺度，防止仅靠计划中的声明放行。
+字段、研究级效应记录和 SHA-256 来源记录详见
+[分析契约说明](references/analysis_contracts.md)。
+
+## 已修正计算的迁移说明
+
+- `effect_size_bca(..., effect_type="lnrr")` 现在明确计算
+  `log(mean(T)/mean(C))`；若目标为 `mean(log(T/C))`，请显式选择
+  `paired_log_ratio`，并声明配对或独立设计。
+- 代理预测验证先应用校准，默认报告观测单位下的偏差和 RMSEP；不再仅因数值
+  全为正值就自动采用比值效应。
+- 年代组默认独立；共享后验成员需要显式声明并对齐 `chronology_group`。
+- 标准化误差、Python KH 推断和 Egger 系数提取均加入数值对照测试。受旧实现
+  影响的结果需要重新计算。
+- 事件比较使用块重抽区间；多窗口不再按 P 值投票。BP 年代请指定
+  `time_direction="BP"`。
+- 单序列连续代理的不确定性默认固定样品位置，IID 配对样品重抽需要显式启用。
+
 ## 2.3 版主要改进
 
 - 增加代理级数据契约和异质代理综合层：分别标准化、统一方向、时间对齐，
@@ -120,6 +173,8 @@ perturbed = age_ensemble_from_errors(
 
 可将下面代码保存为 `example.py`，然后运行 `python example.py`。示例使用内存
 中的合成数组；实际分析时请替换为经过审计的 `ages` 和 `values`。
+两个通道是假设已具有共同目标的湿润/干旱指数，不表示花粉、炭屑等原始代理
+可以直接互换生态含义。
 
 ```python
 import numpy as np
@@ -129,9 +184,9 @@ from scripts.multi_proxy import multi_proxy_synthesis, leave_one_proxy_out
 records = [
     {
         "site_id": "core_A",
-        "proxy_id": "pollen",
-        "proxy_type": "taxa",
-        "target": "vegetation_change",
+        "proxy_id": "wetness_index",
+        "proxy_type": "continuous",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([12., 18., 24.]),
         "direction": "positive",
@@ -139,9 +194,9 @@ records = [
     },
     {
         "site_id": "core_A",
-        "proxy_id": "charcoal",
+        "proxy_id": "dryness_index",
         "proxy_type": "continuous",
-        "target": "vegetation_change",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([8., 5., 2.]),
         "direction": "negative",
@@ -149,9 +204,9 @@ records = [
     },
     {
         "site_id": "core_B",
-        "proxy_id": "pollen",
-        "proxy_type": "taxa",
-        "target": "vegetation_change",
+        "proxy_id": "wetness_index",
+        "proxy_type": "continuous",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([11., 17., 23.]),
         "direction": "positive",
@@ -159,9 +214,9 @@ records = [
     },
     {
         "site_id": "core_B",
-        "proxy_id": "charcoal",
+        "proxy_id": "dryness_index",
         "proxy_type": "continuous",
-        "target": "vegetation_change",
+        "target": "hydroclimate",
         "ages": np.array([0., 100., 200.]),
         "values": np.array([7., 4., 2.]),
         "direction": "negative",
@@ -175,7 +230,10 @@ result = multi_proxy_synthesis(
     n_members=500,
     random_state=42,
 )
-loo = leave_one_proxy_out(records, np.array([0., 50., 100., 150., 200.]))
+loo = leave_one_proxy_out(
+    records, np.array([0., 50., 100., 150., 200.]),
+    n_members=500, random_state=42,
+)
 
 print(result["composite"])
 print(result["uncertainty_band"])
@@ -222,6 +280,8 @@ print(loo["by_excluded_proxy"])
 | 模块 | 功能 |
 |---|---|
 | `scripts/preprocessing.py` | 年龄集合读取、扰动敏感性、标准化、安全插值、命名和保存偏倚记录 |
+| `scripts/analysis_contracts.py` | 可执行路由、原始/分析阶段效应校验、独立簇检查和分析分发 |
+| `scripts/provenance.py` | 输入、参数、代码、来源文件和输出指纹；软件版本 |
 | `scripts/synthesis.py` | SCC、DCC、CPS、PAI、描述性 GAM/LOESS 和蒙特卡洛集合 |
 | `scripts/continuous_proxy.py` | 校准、不等长站点合成、不确定性、时间序列验证和双代理比较 |
 | `scripts/multi_proxy.py` | 代理级校验、目标/方向统一、按站点聚类合成、相关误差传播、一致性和逐代理剔除 |

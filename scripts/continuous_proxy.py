@@ -28,6 +28,9 @@ try:
         interpolate_no_extrapolation,
         normalize_weights,
         weighted_nanmean,
+        finite_uncertainty_band,
+        validate_age_ensembles,
+        draw_chronology_indices,
     )
 except ImportError:  # pragma: no cover - supports direct script imports
     from _utils import (
@@ -36,6 +39,9 @@ except ImportError:  # pragma: no cover - supports direct script imports
         interpolate_no_extrapolation,
         normalize_weights,
         weighted_nanmean,
+        finite_uncertainty_band,
+        validate_age_ensembles,
+        draw_chronology_indices,
     )
 
 
@@ -257,6 +263,7 @@ def composite_continuous_proxy(
     proxy_errors: Optional[np.ndarray] = None,
     n_members: int = 500,
     random_state: Optional[Union[int, np.random.Generator]] = None,
+    chronology_groups: Optional[Sequence[str]] = None,
 ) -> Dict:
     """连续值代理多站点合成（含年龄不确定性传播）。
 
@@ -275,7 +282,8 @@ def composite_continuous_proxy(
         各站点权重 (n_sites,)，默认等权。
     age_ensembles : np.ndarray, optional
         年龄集合 (n_ensemble, n_depths)，用于传播年龄不确定性。
-        若各站点有独立年龄集合，取首个（共享年表）或预处理为统一集合。
+        二维集合显式表示共享年表；逐站点列表或三维集合默认独立抽取。
+        chronology_groups 可声明已按后验成员对齐的共享组。
     proxy_errors : np.ndarray, optional
         各站点代理校准误差 (n_sites,)，用于传播校准不确定性。
     n_members : int, optional
@@ -327,6 +335,8 @@ def composite_continuous_proxy(
             if any(len(ages) != shared.shape[1] for ages in ages_list):
                 raise ValueError('共享 age_ensembles 的样本维度必须匹配每个站点。')
             age_members = [shared] * n_sites
+            if chronology_groups is None:
+                chronology_groups = ['shared'] * n_sites
         elif isinstance(age_ensembles, np.ndarray) and age_ensembles.ndim == 3:
             if age_ensembles.shape[0] != n_sites:
                 raise ValueError('逐站点 age_ensembles 的站点维度不匹配。')
@@ -335,20 +345,20 @@ def composite_continuous_proxy(
             if len(age_ensembles) != n_sites:
                 raise ValueError('逐站点 age_ensembles 的站点数量不匹配。')
             age_members = [as_float_array(v, f'age_ensembles[{i}]', ndim=2, allow_nan=False) for i, v in enumerate(age_ensembles)]
-            for i, (members, ages) in enumerate(zip(age_members, ages_list)):
-                if members.shape[1] != len(ages):
-                    raise ValueError(f'站点 {i} 的 age_ensembles 样本维度不匹配。')
+        age_members = [validate_age_ensembles(pool, len(ages_list[i]), f'age_ensembles[{i}]')
+                       for i, pool in enumerate(age_members)]
 
     rng = get_rng(random_state)
     has_uncertainty = age_members is not None or np.any(errors > 0)
 
     def make_member(member_index: int) -> np.ndarray:
         resampled = np.full((n_sites, len(grid)), np.nan)
+        selected = draw_chronology_indices(age_members, rng, chronology_groups) if age_members is not None else None
         for s in range(n_sites):
             ages_s = ages_list[s]
             if age_members is not None:
                 pool = age_members[s]
-                ages_s = pool[member_index % pool.shape[0]]
+                ages_s = pool[selected[s]]
             values_s = values_list[s]
             if errors[s] > 0:
                 values_s = values_s + rng.normal(0, errors[s], size=len(values_s))
@@ -372,12 +382,7 @@ def composite_continuous_proxy(
     if n_members < 2:
         raise ValueError('有不确定性传播时 n_members 至少为 2。')
     ensembles = np.array([make_member(m) for m in range(n_members)])
-    band = {
-        'lower': np.nanpercentile(ensembles, 5, axis=0),
-        'median': np.nanpercentile(ensembles, 50, axis=0),
-        'upper': np.nanpercentile(ensembles, 95, axis=0),
-        'percentiles': (5, 50, 95),
-    }
+    band = finite_uncertainty_band(ensembles)
     return {
         'composite': band['median'],
         'ensembles': ensembles,
@@ -387,6 +392,7 @@ def composite_continuous_proxy(
         'weights': weights_arr,
         'random_state': random_state if isinstance(random_state, int) else None,
         'extrapolation': 'nan',
+        'chronology_groups': chronology_groups,
     }
 
 
@@ -398,10 +404,12 @@ def propagate_continuous_uncertainty(
     composite_func: Optional[Callable] = None,
     n_members: int = 500,
     random_state: Optional[Union[int, np.random.Generator]] = None,
+    sampling_method: str = 'none',
 ) -> Dict:
     """连续值代理三层不确定性传播（年龄+校准+采样）。
 
-    专为单一连续值代理序列设计的不确定性传播函数。
+    专为单一连续值代理序列设计。默认固定样品位置；sampling_method='iid'
+    仅在有依据把年龄/代理点作为独立样品时启用配对重抽，不自动修复自相关。
     与 validation.propagate_three_layer_uncertainty 的区别：
     后者处理多站点矩阵，本函数处理单站点序列。
 
@@ -427,7 +435,7 @@ def propagate_continuous_uncertainty(
          'uncertainty_band': dict, 'n_members': int, 'layers': list}
     """
     proxy_arr = as_float_array(proxy_values, 'proxy_values', ndim=1, allow_nan=False, min_size=2)
-    age_arr = as_float_array(age_ensembles, 'age_ensembles', ndim=2, allow_nan=False)
+    age_arr = validate_age_ensembles(age_ensembles, len(proxy_arr))
     if age_arr.shape[1] != len(proxy_arr):
         raise ValueError('age_ensembles 的样本维度必须与 proxy_values 一致。')
     if calibration_error < 0 or not np.isfinite(calibration_error):
@@ -438,10 +446,13 @@ def propagate_continuous_uncertainty(
     n_ens_pool = age_arr.shape[0]
     rng = get_rng(random_state)
     ensembles = np.full((n_members, len(grid)), np.nan)
+    if sampling_method not in {'none', 'iid'}:
+        raise ValueError("sampling_method must be 'none' or 'iid'.")
+    skipped_members = 0
 
     for i in range(n_members):
         # 1. 年龄层：采样一个年龄成员（保持地层单调性）
-        ages = age_arr[i % n_ens_pool]
+        ages = age_arr[int(rng.integers(n_ens_pool))]
 
         # 2. 校准层：添加校准误差正态噪声
         noise = rng.normal(0, calibration_error, size=len(proxy_arr))
@@ -449,13 +460,17 @@ def propagate_continuous_uncertainty(
 
         # 3. 采样层：Bootstrap 重采样（对深度点重采样）
         n_depths = len(proxy_arr)
-        boot_idx = rng.choice(n_depths, size=n_depths, replace=True)
+        boot_idx = (rng.choice(n_depths, size=n_depths, replace=True)
+                    if sampling_method == 'iid' else np.arange(n_depths))
         boot_ages = ages[boot_idx]
         boot_values = noisy_values[boot_idx]
         # 保持单调
         sort_idx = np.argsort(boot_ages)
         boot_ages = boot_ages[sort_idx]
         boot_values = boot_values[sort_idx]
+        if len(np.unique(boot_ages)) < 2:
+            skipped_members += 1
+            continue
 
         # 插值到统一网格
         if composite_func is not None:
@@ -465,18 +480,18 @@ def propagate_continuous_uncertainty(
                 boot_ages, boot_values, grid, name=f'member_{i}'
             )
 
-    band = {
-        'lower': np.percentile(ensembles, 5, axis=0),
-        'median': np.percentile(ensembles, 50, axis=0),
-        'upper': np.percentile(ensembles, 95, axis=0),
-    }
+    if not np.any(np.isfinite(ensembles)):
+        raise ValueError('No ensemble member supports the requested grid.')
+    band = finite_uncertainty_band(ensembles)
 
     return {
         'ensembles': ensembles,
         'uncertainty_band': band,
         'n_members': n_members,
-        'layers': ['age', 'calibration', 'sampling'],
-        'method': 'three-layer Monte Carlo (continuous proxy)',
+        'layers': ['age'] + (['calibration'] if calibration_error > 0 else []) + (['iid_pairs_sampling'] if sampling_method == 'iid' else []),
+        'sampling_method': sampling_method,
+        'skipped_members': skipped_members,
+        'method': 'conditional chronology/measurement ensemble (continuous proxy)',
         'random_state': random_state if isinstance(random_state, int) else None,
     }
 

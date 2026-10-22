@@ -18,8 +18,10 @@ R 桥接模块：通过 subprocess 调用 Rscript + metafor 包。
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -70,25 +72,28 @@ def find_rscript() -> Optional[str]:
     """查找 Rscript 可执行文件路径。
 
     搜索顺序：
-    1. PATH 环境变量中的 Rscript
-    2. 常见安装路径列表
-    3. R_USER 环境变量推断
+    1. 显式 R_SCRIPT 环境变量
+    2. PATH 环境变量中的 Rscript
+    3. 常见安装路径列表及 Windows 安装目录
 
     Returns
     -------
     str or None
         Rscript 路径，未找到返回 None。
     """
-    # 1. 尝试 PATH
-    try:
-        result = subprocess.run(
-            ['Rscript', '--version'],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return 'Rscript'
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    configured = os.environ.get('R_SCRIPT', '').strip().strip('"')
+    if configured:
+        candidate = os.path.expandvars(os.path.expanduser(configured))
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        if os.path.isfile(candidate):
+            return candidate
+        raise ValueError(f'R_SCRIPT 指向不存在或不可执行的 Rscript：{configured}')
+
+    resolved = shutil.which('Rscript')
+    if resolved:
+        return resolved
 
     # 2. 尝试常见路径
     for path in _R_PATHS:
@@ -144,7 +149,7 @@ def check_r_environment() -> Dict:
     for (p in pkgs) {
         result[[p]] <- ifelse(requireNamespace(p, quietly=TRUE), "installed", "not_installed")
     }
-    cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+    cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
     '''
 
     # 写临时脚本
@@ -219,13 +224,14 @@ def _run_r_script(
     # 包装脚本：确保 jsonlite 可用，捕获错误
     wrapped = f'''
 if (!requireNamespace("jsonlite", quietly=TRUE)) {{
-  cat(jsonlite::toJSON(list(success=FALSE, error="jsonlite not installed")))
+  cat('{{"success":false,"error":"jsonlite not installed"}}')
   quit(status=0)
 }}
 tryCatch({{
   {r_code}
 }}, error=function(e) {{
-  cat(jsonlite::toJSON(list(success=FALSE, error=as.character(e$message))))
+  cat(jsonlite::toJSON(list(success=FALSE, error=as.character(e$message)),
+                      auto_unbox=TRUE, digits=NA, na="null", null="null"))
   quit(status=0)
 }})
 '''
@@ -270,6 +276,11 @@ tryCatch({{
             'stdout': result.stdout[:500],
             'stderr': result.stderr[:500],
         }
+    except OSError as exc:
+        return {
+            'success': False, 'result': None, 'error': str(exc),
+            'stdout': '', 'stderr': '',
+        }
     except subprocess.TimeoutExpired:
         return {
             'success': False,
@@ -286,12 +297,71 @@ tryCatch({{
 # metafor 核心功能封装
 # ---------------------------------------------------------------------------
 
+def _validate_meta_inputs(effect_sizes, variances, *, min_studies=2):
+    yi = np.asarray(effect_sizes, dtype=float)
+    vi = np.asarray(variances, dtype=float)
+    if yi.ndim != 1 or vi.ndim != 1 or len(yi) != len(vi):
+        raise ValueError('effect_sizes 与 variances 必须是一维且长度一致。')
+    if (len(yi) < min_studies or np.any(~np.isfinite(yi))
+            or np.any(~np.isfinite(vi)) or np.any(vi <= 0)):
+        raise ValueError(f'效应量必须有限，方差必须为正，且至少有 {min_studies} 个研究。')
+    return yi, vi
+
+
+def _check_independent_effects(vi, study_ids=None, sampling_covariance=None):
+    """普通单层模型的能力检查，不替代高层科学分析路由。"""
+    k = len(vi)
+    if study_ids is not None:
+        ids = np.asarray(study_ids, dtype=object)
+        if ids.ndim != 1 or len(ids) != k:
+            raise ValueError('study_ids 必须一维且与效应量长度一致。')
+        seen = set()
+        for study_id in ids:
+            if (study_id is None or str(study_id).strip() == ''
+                    or (isinstance(study_id, (float, np.floating)) and not np.isfinite(study_id))):
+                raise ValueError('study_ids 不得缺失或为空。')
+            try:
+                if study_id in seen:
+                    raise ValueError(
+                        '同研究多效应不能进入 rma.uni 或 Python 独立组回退；'
+                        '请交接支持 sampling V、随机结构和独立簇的多层/多变量接口'
+                        '（如 rma.mv，本桥接未实现）。'
+                    )
+                seen.add(study_id)
+            except TypeError as exc:
+                raise ValueError('study_ids 必须由可哈希的标量标识组成。') from exc
+    if sampling_covariance is not None:
+        covariance = np.asarray(sampling_covariance, dtype=float)
+        if covariance.shape != (k, k) or not np.all(np.isfinite(covariance)):
+            raise ValueError('sampling_covariance 必须是有限的 k×k 矩阵。')
+        if not np.allclose(covariance, covariance.T, rtol=1e-10, atol=0.0):
+            raise ValueError('sampling_covariance 必须对称。')
+        if not np.allclose(np.diag(covariance), vi, rtol=1e-10, atol=0.0):
+            raise ValueError('sampling_covariance 对角线必须与 variances 一致。')
+        if np.any(covariance[~np.eye(k, dtype=bool)] != 0):
+            raise ValueError(
+                '非对角 sampling_covariance 不能被 rma.uni 或 Python 回退忽略；'
+                '请交接完整 V 的多层/多变量接口（如 rma.mv，本桥接未实现）。'
+            )
+    return {
+        'n_independent': k,
+        'independence_assumption': (
+            'one_effect_per_declared_study' if study_ids is not None
+            else 'assumed_one_independent_study_per_effect'
+        ),
+        'sampling_covariance': 'validated_diagonal' if sampling_covariance is not None else 'diagonal_vi',
+    }
+
+
 def rma_random_effects(
     effect_sizes: np.ndarray,
     variances: np.ndarray,
     method: str = 'REML',
     knha: bool = True,
     rscript_path: Optional[str] = None,
+    *,
+    study_ids=None,
+    sampling_covariance=None,
 ) -> Dict:
     """metafor::rma() 随机效应模型（Viechtbauer 2010）。
 
@@ -308,10 +378,14 @@ def rma_random_effects(
         估计方法：'REML' (默认, 限制最大似然), 'DL' (DerSimonian-Laird),
         'ML' (最大似然), 'EB' (经验贝叶斯), 'HS' (Hunter-Schmidt)。
     knha : bool, optional
-        是否使用 Hartung-Knapp 校正（Hartung & Knapp 2001），默认 True。
-        强烈推荐，可控制 I 类错误率。
+        是否使用未修改的 Hartung-Knapp 校正，默认 True。
+        包括 k=2 时使用 t(k-1)；它不是保证保守的加宽区间。
     rscript_path : str, optional
         Rscript 路径，None 时自动查找。
+    study_ids : sequence, optional
+        每效应所属研究；重复 ID 明确交接多层模型，不当作独立研究。
+    sampling_covariance : array-like, optional
+        只接受与 vi 一致的对角矩阵；非对角 V 需另行使用多变量接口。
 
     Returns
     -------
@@ -321,12 +395,8 @@ def rma_random_effects(
          'Q': float, 'Q_pvalue': float, 'method': str, 'knha': bool,
          'backend': 'metafor' or 'python'}
     """
-    yi = np.asarray(effect_sizes, dtype=float)
-    vi = np.asarray(variances, dtype=float)
-    if yi.ndim != 1 or vi.ndim != 1 or len(yi) != len(vi):
-        raise ValueError('effect_sizes 与 variances 必须是一维且长度一致。')
-    if len(yi) < 2 or np.any(~np.isfinite(yi)) or np.any(~np.isfinite(vi)) or np.any(vi <= 0):
-        raise ValueError('效应量必须有限，方差必须为正，且至少有两个研究。')
+    yi, vi = _validate_meta_inputs(effect_sizes, variances)
+    independence = _check_independent_effects(vi, study_ids, sampling_covariance)
 
     # --- 尝试 R + metafor ---
     data_json = _json_for_r({
@@ -353,20 +423,40 @@ result <- list(
     tau2 = as.numeric(rma_fit$tau2),
     Q = as.numeric(rma_fit$QE),
     Q_pvalue = as.numeric(rma_fit$QEp),
-    method = data$method,
-    knha = data$knha,
+    method = rma_fit$method,
+    requested_method = data$method,
+    knha = identical(rma_fit$test, "knha"),
+    test = rma_fit$test,
+    test_statistic = as.numeric(rma_fit$zval),
+    df = if (rma_fit$test == "knha") rma_fit$k - rma_fit$p else NULL,
+    model = "random_effects",
+    model_class = "rma.uni",
+    r_version = R.version.string,
+    metafor_version = as.character(packageVersion("metafor")),
     backend = "metafor"
 )
-cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
 '''
 
     r_result = _run_r_script(r_code, rscript_path)
 
     if r_result['success'] and r_result['result'].get('success'):
-        return r_result['result']
+        result = r_result['result']
+        result.update(independence)
+        result['test_distribution'] = 't' if result['test'] == 'knha' else 'normal'
+        result['inference_available'] = result['se'] > 0
+        if not result['inference_available']:
+            result.update(test_statistic=None, z_value=None, p_value=None)
+            result['warnings'] = ['KH 残差尺度为零，保留点估计和区间，不自动推断。']
+        else:
+            result['warnings'] = []
+        return result
 
     # --- 回退到 Python ---
-    return _rma_python_fallback(yi, vi, method, knha)
+    result = _rma_python_fallback(yi, vi, method, knha)
+    result.update(independence)
+    result['fallback_reason'] = r_result.get('error')
+    return result
 
 
 def _rma_python_fallback(
@@ -384,15 +474,8 @@ def _rma_python_fallback(
     """
     from scipy import stats as sp_stats
 
-    yi = np.asarray(yi, dtype=float)
-    vi = np.asarray(vi, dtype=float)
-    if yi.ndim != 1 or vi.ndim != 1 or len(yi) != len(vi):
-        raise ValueError('yi 与 vi 必须是一维且长度一致。')
-    if np.any(~np.isfinite(yi)) or np.any(~np.isfinite(vi)) or np.any(vi <= 0):
-        raise ValueError('yi 必须有限，vi 必须为正。')
+    yi, vi = _validate_meta_inputs(yi, vi)
     n = len(yi)
-    if n < 2:
-        return {'error': '需至少 2 个研究进行随机效应合并'}
 
     # 固定效应权重
     w_fixed = 1.0 / vi
@@ -403,7 +486,7 @@ def _rma_python_fallback(
     # Cochran's Q
     Q = np.sum(w_fixed * (yi - pooled_fixed) ** 2)
     df = n - 1
-    Q_pvalue = 1 - sp_stats.chi2.cdf(Q, df) if df > 0 else np.nan
+    Q_pvalue = sp_stats.chi2.sf(Q, df)
 
     # tau² (DerSimonian-Laird 估计)
     c = np.sum(w_fixed) - np.sum(w_fixed ** 2) / np.sum(w_fixed)
@@ -417,29 +500,35 @@ def _rma_python_fallback(
     pooled_random = np.sum(w_random * yi) / np.sum(w_random)
     se_random = np.sqrt(1.0 / np.sum(w_random))
 
-    # Hartung-Knapp 校正
-    if knha and n > 2:
-        # HK 标准误放大因子
-        hk_factor = np.sqrt(
-            np.sum(w_random * (yi - pooled_random) ** 2) / (df * np.sum(w_random))
-        )
-        se_random = se_random * hk_factor
+    # 未修改 KH：q = sum(w*(y-mu)^2)/(k-1)，SE = sqrt(q/sum(w))。
+    # k=2 仍有 df=1，不得改用 z 后继续标作 KH。
+    if knha:
+        q = np.sum(w_random * (yi - pooled_random) ** 2) / df
+        se_random = np.sqrt(q / np.sum(w_random))
 
     # Hartung-Knapp 使用 t 分布；没有 HK 时才使用正态近似。
-    if knha and n > 2:
+    if knha:
         critical = sp_stats.t.ppf(0.975, df)
         ci_lower = pooled_random - critical * se_random
         ci_upper = pooled_random + critical * se_random
-        test_value = pooled_random / se_random
-        p_value = 2 * (1 - sp_stats.t.cdf(abs(test_value), df))
         test_name = 'knha'
     else:
         critical = sp_stats.norm.ppf(0.975)
         ci_lower = pooled_random - critical * se_random
         ci_upper = pooled_random + critical * se_random
-        test_value = pooled_random / se_random
-        p_value = 2 * (1 - sp_stats.norm.cdf(abs(test_value)))
         test_name = 'z'
+
+    warning_messages = []
+    if se_random > 0:
+        test_value = float(pooled_random / se_random)
+        p_value = float(2 * (sp_stats.t.sf(abs(test_value), df) if knha
+                             else sp_stats.norm.sf(abs(test_value))))
+    else:
+        test_value = p_value = None
+        warning_messages.append('KH 残差尺度为零，保留点估计和区间，不自动推断。')
+    if str(method).upper() != 'DL':
+        warning_messages.append(f'请求 {method}，Python 回退实际仅实现 DL；结果不冒充请求的估计量。')
+        warnings.warn(warning_messages[-1], RuntimeWarning, stacklevel=2)
 
     return {
         'success': True,
@@ -447,15 +536,23 @@ def _rma_python_fallback(
         'se': float(se_random),
         'ci_lower': float(ci_lower),
         'ci_upper': float(ci_upper),
-        'z_value': float(test_value),
-        'p_value': float(p_value),
+        'z_value': test_value,  # 历史别名；KH 下实际为 t，见 test。
+        'test_statistic': test_value,
+        'p_value': p_value,
         'I2': float(I2),
         'tau2': float(tau2),
         'Q': float(Q),
         'Q_pvalue': float(Q_pvalue),
         'method': 'DL',
-        'knha': knha,
+        'requested_method': method,
+        'knha': bool(knha),
         'test': test_name,
+        'df': int(df) if knha else None,
+        'test_distribution': 't' if knha else 'normal',
+        'model': 'random_effects',
+        'model_class': 'DL_inverse_variance',
+        'inference_available': bool(se_random > 0),
+        'warnings': warning_messages,
         'backend': 'python',
         'note': '使用 DerSimonian-Laird 估计（metafor 不可用时的回退）。'
                 '安装 metafor 可获得 REML/ML 等高级估计方法。',
@@ -527,7 +624,7 @@ result <- list(
     I2 = as.numeric(rma_fit$I2),
     backend = "metafor"
 )
-cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
 '''
 
     r_result = _run_r_script(r_code, rscript_path)
@@ -547,76 +644,132 @@ def egger_test(
     effect_sizes: np.ndarray,
     variances: np.ndarray,
     rscript_path: Optional[str] = None,
+    *,
+    study_ids=None,
+    sampling_covariance=None,
 ) -> Dict:
-    """metafor::regtest() Egger 发表偏倚检验（Egger et al. 1997）。
+    """经典 Egger 小研究效应回归，不输出发表偏倚二元裁决。
 
-    检验效应量与其标准误之间是否存在显著关联（小样本研究偏倚）。
-
-    Parameters
-    ----------
-    effect_sizes : np.ndarray
-        效应量 (n_studies,)。
-    variances : np.ndarray
-        效应量方差 (n_studies,)。
-
-    Returns
-    -------
-    Dict
-        {'z_value': float, 'p_value': float, 'intercept': float,
-         'intercept_se': float, 'backend': str}
+    两后端使用同一参数化：yi/sei = intercept + slope*(1/sei)，
+    intercept、intercept_se、p_value 均属于该截距。metafor 的等价
+    加权 yi ~ sei 模型中，sei 的系数才是这个截距，不能用 limit estimate。
+    test='t'，df=k-2；z_value 是保留的历史统计量别名，不表示正态检验。
+    少于 10 个独立研究或精度跨度极窄时保留可估计的有限诊断值和警告，
+    但 inference_allowed=False，禁止自动显著性/偏倚裁决。study_ids 的
+    重复及非对角 V 需依赖结构专用接口，不得按效应行数扩大独立样本量。
     """
-    yi = np.asarray(effect_sizes, dtype=float)
-    vi = np.asarray(variances, dtype=float)
+    yi, vi = _validate_meta_inputs(effect_sizes, variances)
+    independence = _check_independent_effects(vi, study_ids, sampling_covariance)
+    k = len(yi)
+    warning_messages = [
+        'Egger 仅描述小研究效应/漏斗不对称，不能判定发表偏倚存在或不存在。'
+    ]
+    if k < 10:
+        warning_messages.append(f'仅 {k} 个独立研究（少于 10）；保留探索性诊断，禁止自动推断。')
+    if k < 3:
+        return {
+            'success': False, 'error': 'Egger 回归至少需要 3 个独立研究和非零残差自由度。',
+            'backend': 'none', 'inference_allowed': False, 'warnings': warning_messages,
+            **independence,
+        }
     sei = np.sqrt(vi)
+    precision = 1.0 / sei
+    spread = float(np.ptp(precision))
+    if spread == 0:
+        return {
+            'success': False, 'error': '所有标准误相同，Egger 截距与斜率不可分别识别。',
+            'backend': 'none', 'inference_allowed': False, 'warnings': warning_messages,
+            **independence,
+        }
+    narrow_precision = spread / float(np.max(precision)) < 1e-3
+    if narrow_precision:
+        warning_messages.append('研究精度跨度极窄，截距外推不稳定；禁止自动推断。')
 
     data_json = _json_for_r({
         'yi': yi.tolist(),
-        'sei': sei.tolist(),
+        'vi': vi.tolist(),
     })
 
     r_code = f'''
 library(metafor)
 data <- jsonlite::fromJSON('{data_json}')
-rma_fit <- rma(yi=data$yi, sei=data$sei, method="DL")
-egger <- regtest(rma_fit, model="lm")
+egger <- regtest(data$yi, vi=data$vi, model="lm", predictor="sei", ret.fit=TRUE)
+coefficients <- summary(egger$fit)$coefficients
 result <- list(
     success = TRUE,
-    z_value = as.numeric(egger$zval),
-    p_value = as.numeric(egger$pval),
-    intercept = as.numeric(egger$est),
-    intercept_se = as.numeric(egger$se),
+    test_statistic = as.numeric(coefficients[2, 3]),
+    p_value = as.numeric(coefficients[2, 4]),
+    intercept = as.numeric(coefficients[2, 1]),
+    intercept_se = as.numeric(coefficients[2, 2]),
+    slope = as.numeric(coefficients[1, 1]),
+    slope_se = as.numeric(coefficients[1, 2]),
+    slope_p_value = as.numeric(coefficients[1, 4]),
+    r_version = R.version.string,
+    metafor_version = as.character(packageVersion("metafor")),
     backend = "metafor"
 )
-cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
 '''
 
     r_result = _run_r_script(r_code, rscript_path)
 
     if r_result['success'] and r_result['result'].get('success'):
-        return r_result['result']
+        result = r_result['result']
+    else:
+        from scipy import stats as sp_stats
 
-    # Python 回退：Egger 型回归 z_i = beta_0 + beta_1 * precision_i。
-    # 该回退用于诊断，不宣称与 metafor::regtest 完全等价。
-    from scipy import stats as sp_stats
+        standardized = yi / sei
+        x_centered = precision - np.mean(precision)
+        y_centered = standardized - np.mean(standardized)
+        ssx = float(np.dot(x_centered, x_centered))
+        slope = float(np.dot(x_centered, y_centered) / ssx)
+        intercept = float(np.mean(standardized) - slope * np.mean(precision))
+        residuals = y_centered - slope * x_centered
+        residual_variance = float(np.dot(residuals, residuals) / (k - 2))
+        slope_se = float(np.sqrt(residual_variance / ssx))
+        intercept_se = float(np.sqrt(residual_variance * (1.0 / k + np.mean(precision) ** 2 / ssx)))
+        test_statistic = intercept / intercept_se if intercept_se > 0 else None
+        result = {
+            'success': True,
+            'test_statistic': test_statistic,
+            'p_value': float(2 * sp_stats.t.sf(abs(test_statistic), k - 2)) if test_statistic is not None else None,
+            'intercept': intercept,
+            'intercept_se': intercept_se,
+            'slope': slope,
+            'slope_se': slope_se,
+            'slope_p_value': float(2 * sp_stats.t.sf(abs(slope / slope_se), k - 2)) if slope_se > 0 else None,
+            'backend': 'python',
+            'fallback_reason': r_result.get('error'),
+        }
 
-    if len(yi) < 3:
-        return {'error': 'Egger 检验需至少 3 个研究'}
-
-    if np.any(sei <= 0) or not np.all(np.isfinite(sei)):
-        return {'success': False, 'error': '标准误必须为正且有限。', 'backend': 'python'}
-    precision = 1.0 / sei
-    standardized = yi / sei
-    slope, intercept, r, p_val, se = sp_stats.linregress(precision, standardized)
-
-    return {
-        'success': True,
-        'z_value': float(intercept / se),
-        'p_value': float(p_val),
-        'intercept': float(intercept),
-        'intercept_se': float(se),
-        'backend': 'python',
-        'note': '使用 Egger 型精度回归回退；不等同于 metafor::regtest。',
-    }
+    finite_inference = (result.get('intercept_se') is not None
+                        and result['intercept_se'] > 0
+                        and result.get('p_value') is not None
+                        and np.isfinite(result['p_value'])
+                        and result.get('test_statistic') is not None
+                        and np.isfinite(result['test_statistic']))
+    if not finite_inference:
+        warning_messages.append('截距检验的残差尺度退化；保留可估计系数，不自动推断。')
+        result.update(test_statistic=None, p_value=None)
+    result.update(independence)
+    result.update({
+        'bias_intercept': result['intercept'],
+        'bias_intercept_se': result['intercept_se'],
+        'intercept_p_value': result['p_value'],
+        'z_value': result['test_statistic'],
+        't_value': result['test_statistic'],
+        'test': 't',
+        'df': k - 2,
+        'model': 'egger_precision_ols',
+        'parameterization': 'yi/sei = intercept + slope*(1/sei)',
+        'inference_allowed': bool(k >= 10 and not narrow_precision and finite_inference),
+        'exploratory': bool(k < 10 or narrow_precision or not finite_inference),
+        'warnings': warning_messages,
+        'note': warning_messages[0],
+    })
+    if len(warning_messages) > 1:
+        warnings.warn(' '.join(warning_messages[1:]), RuntimeWarning, stacklevel=2)
+    return result
 
 
 def forest_plot(
@@ -674,7 +827,7 @@ result <- list(
     output_path = data$output,
     backend = "metafor"
 )
-cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
 '''
 
     r_result = _run_r_script(r_code, rscript_path)
@@ -737,7 +890,7 @@ result <- list(
     output_path = data$output,
     backend = "metafor"
 )
-cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
 '''
 
     r_result = _run_r_script(r_code, rscript_path)
@@ -758,8 +911,16 @@ def subgroup_analysis(
     variances: np.ndarray,
     groups: np.ndarray,
     rscript_path: Optional[str] = None,
+    *,
+    method: str = 'REML',
+    knha: bool = True,
+    study_ids=None,
+    sampling_covariance=None,
 ) -> Dict:
-    """亚组分析（分组估计效应量和异质性）。
+    """亚组随机效应估计，保留实际估计量、检验和后端。
+
+    R 使用指定 method/test；Python 仅 DL，组间比较未实现则明确返回 None。
+    Q_between 是历史字段，R+KH 时实际为 F，见 Q_between_test/df。
 
     Parameters
     ----------
@@ -776,26 +937,38 @@ def subgroup_analysis(
         {'subgroups': dict, 'Q_between': float, 'Q_between_pvalue': float,
          'backend': str}
     """
-    yi = np.asarray(effect_sizes, dtype=float)
-    vi = np.asarray(variances, dtype=float)
-    groups = np.asarray(groups)
+    yi, vi = _validate_meta_inputs(effect_sizes, variances)
+    independence = _check_independent_effects(vi, study_ids, sampling_covariance)
+    groups = np.asarray(groups, dtype=object)
+    if groups.ndim != 1 or len(groups) != len(yi):
+        raise ValueError('groups 必须一维且与效应量长度一致。')
+    for group in groups:
+        if (group is None or str(group).strip() == ''
+                or (isinstance(group, (float, np.floating)) and not np.isfinite(group))):
+            raise ValueError('groups 不得缺失或为空。')
 
     data_json = _json_for_r({
         'yi': yi.tolist(),
         'vi': vi.tolist(),
         'groups': groups.tolist(),
+        'method': method,
+        'test': 'knha' if knha else 'z',
     })
 
     r_code = f'''
 library(metafor)
 data <- jsonlite::fromJSON('{data_json}')
-rma_fit <- rma(yi=data$yi, vi=data$vi, mods=~factor(data$groups), method="REML")
+rma_fit <- NULL
+if (length(unique(data$groups)) > 1 && length(data$yi) > length(unique(data$groups))) {{
+    rma_fit <- rma(yi=data$yi, vi=data$vi, mods=~factor(data$groups),
+                   method=data$method, test=data$test)
+}}
 # 各亚组分别估计
 subgroups <- list()
 for (g in unique(data$groups)) {{
     idx <- data$groups == g
     if (sum(idx) >= 2) {{
-        sub_rma <- rma(yi=data$yi[idx], vi=data$vi[idx], method="REML")
+        sub_rma <- rma(yi=data$yi[idx], vi=data$vi[idx], method=data$method, test=data$test)
         subgroups[[as.character(g)]] <- list(
             n = sum(idx),
             pooled = as.numeric(sub_rma$b),
@@ -804,24 +977,45 @@ for (g in unique(data$groups)) {{
             ci_upper = as.numeric(sub_rma$ci.ub),
             p_value = as.numeric(sub_rma$pval),
             I2 = as.numeric(sub_rma$I2),
-            tau2 = as.numeric(sub_rma$tau2)
+            tau2 = as.numeric(sub_rma$tau2),
+            method = sub_rma$method,
+            requested_method = data$method,
+            test = sub_rma$test,
+            knha = identical(sub_rma$test, "knha"),
+            df = if (sub_rma$test == "knha") sub_rma$k - sub_rma$p else NULL,
+            model = "random_effects",
+            backend = "metafor"
         )
     }}
 }}
 result <- list(
     success = TRUE,
     subgroups = subgroups,
-    Q_between = as.numeric(rma_fit$QM),
-    Q_between_pvalue = as.numeric(rma_fit$QMp),
+    Q_between = if (is.null(rma_fit)) NULL else as.numeric(rma_fit$QM),
+    Q_between_pvalue = if (is.null(rma_fit)) NULL else as.numeric(rma_fit$QMp),
+    Q_between_test = if (is.null(rma_fit)) NULL else if (rma_fit$test == "knha") "F" else "chi2",
+    Q_between_df = if (is.null(rma_fit)) NULL else as.numeric(rma_fit$QMdf),
+    method = data$method,
+    requested_method = data$method,
+    test = data$test,
+    knha = identical(data$test, "knha"),
+    model = "subgroup_random_effects",
+    r_version = R.version.string,
+    metafor_version = as.character(packageVersion("metafor")),
     backend = "metafor"
 )
-cat(jsonlite::toJSON(result, auto_unbox=TRUE))
+cat(jsonlite::toJSON(result, auto_unbox=TRUE, digits=NA, na="null", null="null"))
 '''
 
     r_result = _run_r_script(r_code, rscript_path)
 
     if r_result['success'] and r_result['result'].get('success'):
-        return r_result['result']
+        result = r_result['result']
+        result.update(independence)
+        result['warnings'] = []
+        if result['Q_between'] is None:
+            result['warnings'].append('亚组水平不足或无残差自由度，不计算组间检验。')
+        return result
 
     # Python 回退：逐组使用同一 DL/HK 实现；组间 Q 仍需要 metafor。
     subgroups = {}
@@ -831,7 +1025,7 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
             continue
         yi_g = yi[mask]
         vi_g = vi[mask]
-        group_result = _rma_python_fallback(yi_g, vi_g, method='DL', knha=True)
+        group_result = _rma_python_fallback(yi_g, vi_g, method=method, knha=knha)
         subgroups[str(g)] = {
             'n': int(mask.sum()),
             'pooled': group_result.get('pooled_effect'),
@@ -841,6 +1035,14 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
             'p_value': group_result.get('p_value'),
             'I2': group_result.get('I2'),
             'tau2': group_result.get('tau2'),
+            'method': group_result['method'],
+            'requested_method': group_result['requested_method'],
+            'test': group_result['test'],
+            'knha': group_result['knha'],
+            'df': group_result['df'],
+            'model': group_result['model'],
+            'backend': group_result['backend'],
+            'warnings': group_result['warnings'],
         }
 
     return {
@@ -848,8 +1050,18 @@ cat(jsonlite::toJSON(result, auto_unbox=TRUE))
         'subgroups': subgroups,
         'Q_between': None,
         'Q_between_pvalue': None,
+        'Q_between_test': None,
+        'Q_between_df': None,
+        'method': 'DL',
+        'requested_method': method,
+        'test': 'knha' if knha else 'z',
+        'knha': bool(knha),
+        'model': 'subgroup_random_effects',
         'backend': 'python',
-        'note': '使用固定效应回退（metafor 不可用）。组间 Q 统计量需 metafor。',
+        'warnings': ['Python 仅实现 DL 随机效应亚组估计，未计算组间检验。'],
+        'fallback_reason': r_result.get('error'),
+        'note': '使用 DL 随机效应回退（非固定效应）。组间检验需 metafor。',
+        **independence,
     }
 
 

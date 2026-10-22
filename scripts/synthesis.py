@@ -24,6 +24,7 @@ try:
         normalize_weights,
         weighted_nanmean,
         validate_age_ensembles,
+        draw_chronology_indices,
     )
 except ImportError:  # pragma: no cover - supports direct script imports
     from _utils import (
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - supports direct script imports
         normalize_weights,
         weighted_nanmean,
         validate_age_ensembles,
+        draw_chronology_indices,
     )
 
 
@@ -111,6 +113,7 @@ def cps_composite(
     z_scores: np.ndarray,
     baseline_mean: float,
     baseline_std: float,
+    weights: Optional[np.ndarray] = None,
 ) -> Dict:
     """Kaufman 2020 Composite Plus Scale (CPS)。
 
@@ -133,7 +136,7 @@ def cps_composite(
     values = as_float_array(z_scores, 'z_scores', ndim=2)
     if not np.isfinite(baseline_std) or baseline_std < 0:
         raise ValueError('baseline_std 必须为非负有限值。')
-    composite_z = np.nanmean(values, axis=0)
+    composite_z = weighted_nanmean(values, weights)
     composite = composite_z * baseline_std + baseline_mean
     return {
         'composite': composite,
@@ -169,13 +172,14 @@ def pai_composite(
         raise ValueError("direction 须为 'positive' 或 'negative'。")
     n_sites, n_bins = values.shape
     diff = np.full_like(values, np.nan)
-    diff[:, 0] = 0.0
     if n_bins > 1:
         diff[:, 1:] = np.diff(values, axis=1)
     valid = np.isfinite(diff)
-    signs = np.where(direction == 'positive', diff > 0, diff < 0)
+    oriented = np.sign(diff) * (1 if direction == 'positive' else -1)
+    # A tie contributes zero directional evidence. The initial bin has no
+    # preceding observation and remains undefined.
     agreement_ratio = np.divide(
-        np.sum(np.where(valid, signs, False), axis=0),
+        np.sum(np.where(valid, (oriented + 1) / 2, 0.0), axis=0),
         np.sum(valid, axis=0),
         out=np.full(n_bins, np.nan, dtype=float),
         where=np.sum(valid, axis=0) > 0,
@@ -187,6 +191,8 @@ def pai_composite(
         'composite': composite,
         'agreement_ratio': agreement_ratio,
         'method': 'PAI',
+        'valid_change_count': np.sum(valid, axis=0),
+        'tie_policy': 'neutral',
     }
 
 
@@ -250,8 +256,9 @@ def monte_carlo_ensemble(
     composite_func: Callable,
     n_members: int = 500,
     random_state: Optional[Union[int, np.random.Generator]] = None,
+    chronology_groups: Optional[List[str]] = None,
 ) -> Dict:
-    """Kaufman 2020 500 成员集合策略：传播年龄+校准+采样三层不确定性。
+    """传播年龄和测量误差；此函数不进行站点或样品 bootstrap。
 
     每个集合成员独立执行完整合成流程，整体采样年龄成员保持地层单调性。
 
@@ -289,6 +296,8 @@ def monte_carlo_ensemble(
         if age_arr.shape[0] != values.shape[0] or age_arr.shape[2] != values.shape[1]:
             raise ValueError('逐站点 age_ensembles 必须为 (sites, members, samples)。')
         n_pool = age_arr.shape[1]
+        for site_index in range(len(age_arr)):
+            validate_age_ensembles(age_arr[site_index], values.shape[1])
     if n_members < 1:
         raise ValueError('n_members 至少为 1。')
     rng = get_rng(random_state)
@@ -296,9 +305,10 @@ def monte_carlo_ensemble(
 
     for i in range(n_members):
         if age_arr.ndim == 2:
-            ages = age_arr[i % n_pool]
+            ages = age_arr[int(rng.integers(n_pool))]
         else:
-            ages = age_arr[:, i % n_pool, :]
+            selected = draw_chronology_indices(age_arr, rng, chronology_groups)
+            ages = np.asarray([pool[index] for pool, index in zip(age_arr, selected)])
         # 采样代理校准不确定性
         noise = rng.normal(0, errors[:, np.newaxis], size=values.shape)
         noisy_values = values + noise
@@ -311,6 +321,7 @@ def monte_carlo_ensemble(
         'n_members': n_members,
         'method': 'Monte Carlo',
         'random_state': random_state if isinstance(random_state, int) else None,
+        'uncertainty_layers': ['chronology'] + (['measurement'] if np.any(errors > 0) else []),
     }
 
 

@@ -154,10 +154,21 @@ def consume_bacon_ages(bacon_output_path: str) -> Dict:
         {'age_ensembles': np.ndarray (n_members, n_depths),
          'depths': np.ndarray, 'n_members': int, 'method': 'Bacon'}
     """
-    try:
-        df = pd.read_csv(bacon_output_path, sep=r'\s+')
-    except Exception:
-        df = pd.read_csv(bacon_output_path)
+    # Read once so file-like objects also work. A comma CSV does not raise
+    # when read with a whitespace separator; it is silently read as one column.
+    from io import StringIO
+    from pathlib import Path
+    if hasattr(bacon_output_path, 'read'):
+        content = bacon_output_path.read()
+    else:
+        content = Path(bacon_output_path).read_text(encoding='utf-8-sig')
+    if isinstance(content, bytes):
+        content = content.decode('utf-8-sig')
+    first_line = next((line for line in content.splitlines() if line.strip()), '')
+    delimiter = ',' if ',' in first_line else r'\s+'
+    df = pd.read_csv(StringIO(content), sep=delimiter)
+    if df.empty:
+        raise ValueError('Chronology table contains no observations.')
 
     if 'depth' in df.columns:
         depths = df['depth'].values

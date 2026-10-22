@@ -1,15 +1,12 @@
 ---
 name: paleoecology-meta-analysis
 description: >-
-  Generic, reproducible synthesis of multi-site paleoecology and paleoclimate
-  proxy records. Use for data audits, chronology-ensemble alignment, taxa or
-  continuous-proxy standardization, multi-proxy common-target synthesis,
-  regional time-series synthesis, leave-one-proxy validation, uncertainty
-  propagation, dependence checks, and cautious climate-versus-human-activity
-  comparisons. Supports pollen, diatoms,
-  foraminifera, plant macrofossils, charcoal, biomarkers, isotopes, and other
-  stratigraphic proxies without assuming a region, archive, proxy calibration,
-  or causal interpretation.
+  Audit and synthesize paleoecology and paleoclimate proxy records across sites
+  and proxy types. Use for chronology-ensemble alignment, common-target proxy
+  synthesis, calibration validation, event-window associations, and study-level
+  effect synthesis with explicit scales, independent clusters, and provenance.
+  Preserve archive-specific ecology and chronology; route unsupported dependent
+  effects or incompatible targets to a specialist or narrative synthesis.
 ---
 
 # Generic paleoecology proxy synthesis
@@ -19,6 +16,22 @@ Start by identifying the estimand, archive, proxy type, chronology source, and
 dependence structure. Keep observed data, transformations, model outputs, and
 interpretations separate.
 
+## Choose an analysis route
+
+For a new analysis, adapt `assets/analysis_plan.json` and call
+`scripts.analysis_contracts.run_analysis(plan, data, **parameters)`. Read
+`references/analysis_contracts.md` for the field contract and handoff examples.
+The route validates the estimand, data level, analysis scale, independent
+cluster and dependence before dispatching. A non-pooling/specialist decision
+returns `status='not_fitted'` and the reason; it does not fit an ordinary Meta
+model. Keep this decision in the report.
+
+Use the low-level numerical helpers for a specified component or an existing
+validated workflow. A function being available does not establish that its
+assumptions hold. This skill includes its own compact routing and provenance
+implementation, informed by EasyMeta; it does not require EasyMeta to be
+installed or launch a full systematic review for a time-series task.
+
 ## Operating rules
 
 1. Audit the data before selecting a method.
@@ -27,8 +40,8 @@ interpretations separate.
 3. Preserve raw counts, denominators, units, site IDs, sample IDs, and source
    metadata. Never overwrite raw values with percentages or z-scores.
 4. Treat compositional taxa data and continuous proxies as different channels.
-5. Propagate uncertainty independently for each site before regional synthesis;
-   do not silently reuse one site's age ensemble for all sites.
+5. Draw independent chronology groups independently. Share members only within
+   an explicitly aligned chronology group; record this assumption.
 6. Renormalize weights when values are missing at a time bin. Do not silently
    extrapolate outside an observed age range.
 7. Treat LOESS/GAM as descriptive unless the model includes an explicit
@@ -42,6 +55,9 @@ interpretations separate.
 11. Do not combine proxies with different targets. Keep all proxies from one
     archive in one site bootstrap cluster unless a design explicitly justifies
     a different unit of replication.
+12. Distinguish sampling-error covariance, true-effect/process dependence, and
+    coefficient inference. Site bootstrap does not create an effect-size V
+    matrix or supply missing independent replication.
 
 ## Required data contract
 
@@ -66,6 +82,8 @@ For a heterogeneous multi-proxy synthesis, use one record per `site_id` ×
 common construct being synthesized (for example, hydroclimate or fire
 activity), not merely the study region. `direction` must make a larger
 transformed value support the same target interpretation across proxies.
+For a shared uncertain chronology group, supply matching `age_member_ids` for
+each record. Equal row counts alone do not prove shared posterior identity.
 
 For ragged multi-site data, keep a list of per-site arrays or long-form rows.
 Do not pad observations with zeros. Use `NaN` only for genuinely missing values.
@@ -84,8 +102,12 @@ or causal. Select one of these designs:
 | `time_series_stacking` | Multiple records aligned to a common time grid | Apply classic independent-study effect sizes to site stacks |
 | `before_after` | Event-window comparison | Call a raw pre/post contrast a causal effect |
 | `calibration` | Proxy–environment training/validation | Report in-sample fit as predictive skill |
+| `multi_proxy` | Different proxy channels informing one declared target | Treat proxy counts as independent regional replication |
+| `study_meta` | Derived study effects and their sampling variances | Pass raw samples, mixed scales or repeated effects as independent studies |
+| `narrative` | Incompatible targets or unsupported quantitative pooling | Discard evidence because it cannot be pooled |
 
-Use `scripts/scenarios.py::select_scenario` only after this design decision.
+Use `select_scenario()` as a descriptive lookup. Use `route_analysis()` and
+`run_analysis()` for the executable decision and data checks.
 
 ### 2. Audit and harmonize
 
@@ -164,6 +186,20 @@ For genuinely heterogeneous proxies, use `scripts/multi_proxy.py`:
    use a common z-score to erase proxy-specific calibration, transport,
    preservation, or ecological mechanisms.
 
+For research-level effects, keep `raw_extraction` and `analysis_effect` separate.
+Preserve study/report/effect IDs, source location, measure, target, unit,
+`analysis_scale`, `yi`, `vi`, and `sei` when reported. Check `vi = sei**2` on
+the analysis scale. The ordinary Meta runner accepts verified independent
+effects only. Repeated studies or known sampling covariance require an
+appropriate multilevel/multivariate implementation; retain the handoff rather
+than substituting a diagonal variance.
+
+Choose `lnrr` for `log(mean(T)/mean(C))`, and `paired_log_ratio` for
+`mean(log(T/C))`. Declare paired versus independent design for resampling and
+variance. Prediction validation defaults to mean bias and RMSEP in the
+observation unit, applying any supplied calibration first. Positivity alone
+does not establish a ratio-scale estimand.
+
 This common-target synthesis is a transparent evidence-combination layer. It
 is not a proxy forward model, REVEALS, a latent-variable model, or a causal
 multi-proxy attribution model. Use an archive-specific or hierarchical model
@@ -180,6 +216,12 @@ layers are actually available:
 - measurement or calibration: reported error model or residual distribution;
 - sampling/site uncertainty: an appropriate bootstrap or hierarchical model.
 
+`propagate_continuous_uncertainty()` defaults to fixed sample positions; an
+IID pairs bootstrap requires explicit selection. Check finite member counts
+per bin. Event-window comparisons default to circular-block percentile
+intervals and record block length. Declare `time_direction='BP'` when older
+ages are numerically larger.
+
 Use a local `random_state`. Label percentile bands as uncertainty quantiles or
 bootstrap intervals; do not call them Bayesian credible intervals unless a
 Bayesian model generated them. Check member-count sensitivity and Monte Carlo
@@ -194,7 +236,7 @@ Run the relevant checks in `validation.py`:
 - spatial autocorrelation with a declared coordinate distance and neighborhood;
 - block or moving-block bootstrap for dependent series;
 - leave-one-site-out and parameter sensitivity checks;
-- multiple windows, indicators, taxa, or proxies with multiplicity acknowledged.
+- multiple windows, indicators, taxa, or proxies with multiplicity acknowledged;
 - leave-one-proxy-out sensitivity and proxy disagreement diagnostics for any
   heterogeneous synthesis.
 
@@ -214,12 +256,20 @@ provenance record with:
 - excluded or extrapolated bins (normally none);
 - limitations and alternative explanations.
 
+`run_analysis()` attaches a manifest with SHA-256 fingerprints of inputs,
+parameters, outputs and code, source-file hashes when supplied, and software
+versions. Preserve original extraction/source judgments separately; a hash
+checks identity, not the validity of a measurement or interpretation.
+
 Use `quasi_experiment_effect_size` and `scenario3_human_attribution` with
 association language. Climate and human indicators should be compared in a
 joint temporal framework when the scientific question is attribution.
 
 ## Module map
 
+- `scripts/analysis_contracts.py`: analysis routing, study-effect validation,
+  guarded dispatch, explicit non-pooling/specialist output.
+- `scripts/provenance.py`: content/file fingerprints and actual-run manifests.
 - `scripts/preprocessing.py`: validation-aware chronology consumption,
   perturbation sensitivity, standardization, interpolation, naming, and bias
   documentation.

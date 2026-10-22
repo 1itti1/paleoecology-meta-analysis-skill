@@ -28,6 +28,8 @@ def as_float_array(
         raise ValueError(f"{name} 必须是 {ndim} 维数组，实际为 {arr.ndim} 维。")
     if arr.size < min_size:
         raise ValueError(f"{name} 至少需要 {min_size} 个元素。")
+    if np.any(np.isinf(arr)):
+        raise ValueError(f"{name} 含有无穷值。")
     if not allow_nan and not np.all(np.isfinite(arr)):
         raise ValueError(f"{name} 含有 NaN 或无穷值。")
     return arr
@@ -90,6 +92,8 @@ def interpolate_no_extrapolation(ages, values, time_grid, *, name: str = "series
 
 def normalize_weights(weights, n: int) -> np.ndarray:
     """Validate non-negative weights and normalize them to sum to one."""
+    if n < 1:
+        raise ValueError('At least one weighted observation is required.')
     if weights is None:
         return np.full(n, 1.0 / n)
     w = as_float_array(weights, "weights", ndim=1, allow_nan=False)
@@ -126,5 +130,57 @@ def validate_age_ensembles(age_ensembles, n_samples: int, name: str = "age_ensem
         raise ValueError(f"{name} 的第二维必须为 {n_samples}，实际为 {arr.shape[1]}。")
     if arr.shape[0] < 1:
         raise ValueError(f"{name} 至少需要一个成员。")
+    differences = np.diff(arr, axis=1)
+    monotonic = np.all(differences >= 0, axis=1) | np.all(differences <= 0, axis=1)
+    if not np.all(monotonic):
+        raise ValueError(f'{name} contains age reversals.')
+    if n_samples > 1 and np.any(np.all(differences == 0, axis=1)):
+        raise ValueError(f'{name} contains a member without distinct ages.')
     return arr
+
+
+def finite_uncertainty_band(ensembles, percentiles=(5, 50, 95)) -> dict:
+    """Compute per-bin quantiles and report how many members support each bin."""
+    values = as_float_array(ensembles, 'ensembles', ndim=2)
+    if len(percentiles) != 3 or not 0 <= percentiles[0] < percentiles[1] < percentiles[2] <= 100:
+        raise ValueError('Specify three strictly ordered percentiles in [0, 100].')
+    bands = np.full((3, values.shape[1]), np.nan)
+    counts = np.isfinite(values).sum(axis=0)
+    for index in np.flatnonzero(counts):
+        column = values[:, index]
+        bands[:, index] = np.percentile(column[np.isfinite(column)], percentiles)
+    return {
+        'lower': bands[0], 'median': bands[1], 'upper': bands[2],
+        'percentiles': tuple(percentiles), 'valid_member_count': counts,
+        'interval_type': 'ensemble_quantiles',
+    }
+
+
+def draw_chronology_indices(pools, rng, groups=None):
+    """Draw independent posterior members across groups, shared members within one.
+
+    An explicit group declares that posterior rows are jointly aligned. A pool
+    can be None for a deterministic chronology, which is not drawn.
+    """
+    if groups is None:
+        groups = list(range(len(pools)))
+    if len(groups) != len(pools):
+        raise ValueError('chronology_groups must contain one entry per record.')
+    sizes, selected = {}, {}
+    output = []
+    for index, (pool, group) in enumerate(zip(pools, groups)):
+        if pool is None:
+            output.append(None)
+            continue
+        key = ('independent', index) if group is None else ('shared', group)
+        try:
+            old_size = sizes.setdefault(key, len(pool))
+        except TypeError as exc:
+            raise ValueError('chronology group identifiers must be hashable.') from exc
+        if old_size != len(pool):
+            raise ValueError('Shared chronology groups require matching posterior member counts.')
+        if key not in selected:
+            selected[key] = int(rng.integers(len(pool)))
+        output.append(selected[key])
+    return output
 

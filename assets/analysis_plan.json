@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "product": "regional_time_series_synthesis",
+  "target": "hydroclimate",
+  "estimand": "site_weighted_common_target_index",
+  "data_level": "proxy_records",
+  "design": "multi_proxy",
+  "analysis_scale": "standardized",
+  "age_unit": "cal_year_BP",
+  "independent_cluster": "site_id",
+  "dependence": "within_site",
+  "sampling_covariance": "not_applicable",
+  "pooling_eligible": true,
+  "pooling_reason": null
+}

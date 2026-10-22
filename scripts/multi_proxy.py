@@ -13,8 +13,9 @@ for a proxy-specific forward model, REVEALS, or a Bayesian hierarchical model.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from itertools import combinations
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -35,6 +36,20 @@ except ImportError:  # pragma: no cover - supports direct script imports
 
 
 _STANDARDIZATION_METHODS = {"zscore", "robust", "none"}
+_PREPARATION_VERSION = 1
+_CHRONOLOGY_ASSUMPTIONS = [
+    "Different chronology groups are sampled independently. Records without "
+    "chronology_group are independent records, including records at the same site.",
+    "Shared chronology_group membership asserts a joint posterior: age_member_ids "
+    "identify corresponding members, never their storage row numbers. This "
+    "correspondence must be justified by the caller.",
+]
+
+
+class _StandardizedValues(NamedTuple):
+    values: np.ndarray
+    location: float
+    scale: float
 
 
 def _text(value, name: str) -> str:
@@ -86,7 +101,7 @@ def _standardize_values(
     ages: np.ndarray,
     method: str,
     baseline_period: Optional[Tuple[float, float]],
-) -> Tuple[np.ndarray, float, float]:
+) -> _StandardizedValues:
     """Return transformed values, location, and scale."""
     if method not in _STANDARDIZATION_METHODS:
         raise ValueError(
@@ -111,7 +126,7 @@ def _standardize_values(
             )
 
     if method == "none":
-        return values.copy(), 1.0, 0.0
+        return _StandardizedValues(values.copy(), 0.0, 1.0)
 
     fit = values[fit_mask]
     if method == "zscore":
@@ -131,7 +146,7 @@ def _standardize_values(
             "the proxy record is not informative for synthesis."
         )
     transformed = (values - location) / scale
-    return transformed, scale, location
+    return _StandardizedValues(transformed, location, scale)
 
 
 def _measurement_error(
@@ -141,9 +156,16 @@ def _measurement_error(
     name: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Normalize a scalar or sample-level measurement error to transformed units."""
-    candidates = [
-        key for key in ("measurement_error", "error", "proxy_error") if key in record
-    ]
+    if record.get("_multi_proxy_prepared") == _PREPARATION_VERSION:
+        # Prepared measurement_error is already in analysis units. Recompute
+        # from the retained raw errors, not from that derived field or aliases.
+        if "measurement_error_raw" not in record:
+            raise ValueError(f"{name} is prepared but lacks measurement_error_raw.")
+        candidates = ["measurement_error_raw"]
+    else:
+        candidates = [
+            key for key in ("measurement_error", "error", "proxy_error") if key in record
+        ]
     if len(candidates) > 1:
         raise ValueError(
             f"{name} specifies more than one measurement-error field: {candidates}."
@@ -171,12 +193,105 @@ def _record_iter(proxy_records) -> List[Mapping]:
         required = {"site_id", "proxy_id", "ages", "values"}
         if required.issubset(proxy_records):
             return [proxy_records]
+        if "_multi_proxy_prepared" in proxy_records:
+            if proxy_records["_multi_proxy_prepared"] != _PREPARATION_VERSION:
+                raise ValueError("Unsupported prepared proxy-record version.")
+            return list(proxy_records["records"])
         return list(proxy_records.values())
     try:
         records = list(proxy_records)
     except TypeError as exc:
         raise ValueError("proxy_records must be a record or an iterable of records.") from exc
     return records
+
+
+def _age_member_ids(value, n_members: int, name: str) -> Optional[Tuple[str, ...]]:
+    if value is None:
+        return None
+    ids = np.asarray(value, dtype=object)
+    if ids.ndim != 1 or len(ids) != n_members:
+        raise ValueError(f"{name} must contain one ID per age_ensembles row.")
+    normalized = []
+    for member_id in ids:
+        if not isinstance(member_id, (str, int, float, np.integer, np.floating)):
+            raise ValueError(f"{name} must contain non-empty, finite scalar IDs.")
+        if not isinstance(member_id, str) and not np.isfinite(member_id):
+            raise ValueError(f"{name} must contain non-empty, finite scalar IDs.")
+        normalized.append(_text(member_id, name))
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{name} must contain unique IDs.")
+    return tuple(normalized)
+
+
+def _chronology_groups(records: Sequence[Mapping]) -> List[Dict]:
+    """Validate joint-member identities and map canonical members to row indices.
+
+    A site ID is not evidence of a shared chronology. Unlabelled records get
+    separate groups. Canonical ordering makes seeded draws insensitive to row
+    permutations, but does not couple draws from independent groups.
+    """
+    grouped = defaultdict(list)
+    for index, record in enumerate(records):
+        declared = record["chronology_group"]
+        key = ("record", record["record_id"]) if declared is None else ("group", declared)
+        grouped[key].append(index)
+
+    groups = []
+    for (kind, group_id), indices in sorted(grouped.items()):
+        uncertain = [i for i in indices if records[i]["age_ensembles"] is not None]
+        shared = kind == "group" and len(indices) > 1
+        if shared and uncertain:
+            if len(uncertain) != len(indices):
+                raise ValueError(
+                    f"chronology_group {group_id!r} mixes records with and without "
+                    "age_ensembles; shared member correspondence is undefined."
+                )
+            if any(records[i]["age_member_ids"] is None for i in indices):
+                raise ValueError(
+                    f"Shared chronology_group {group_id!r} requires explicit "
+                    "age_member_ids for every record; row order is not a correspondence."
+                )
+            expected = set(records[indices[0]]["age_member_ids"])
+            if any(set(records[i]["age_member_ids"]) != expected for i in indices):
+                raise ValueError(
+                    f"Shared chronology_group {group_id!r} must have the same "
+                    "age_member_ids (and member count) in every record."
+                )
+
+        row_indices = {}
+        member_ids = None
+        n_available = 0
+        for i in uncertain:
+            record = records[i]
+            ids = record["age_member_ids"]
+            n_available = len(record["age_ensembles"])
+            if ids is None:
+                # Equal-probability members without identity can be ordered by
+                # their age trajectories, never matched to another record.
+                order = np.lexsort(record["age_ensembles"].T[::-1])
+            else:
+                member_ids = sorted(ids)
+                positions = {member_id: row for row, member_id in enumerate(ids)}
+                order = np.asarray([positions[member_id] for member_id in member_ids])
+            row_indices[record["record_id"]] = order
+        groups.append(
+            {
+                "chronology_group": group_id if kind == "group" else None,
+                "group_type": "declared" if kind == "group" else "independent_record",
+                "record_ids": [records[i]["record_id"] for i in indices],
+                "n_available_members": n_available,
+                "member_ids": member_ids,
+                "row_indices": row_indices,
+            }
+        )
+    return groups
+
+
+def _chronology_metadata(groups: Sequence[Mapping]) -> List[Dict]:
+    return [
+        {key: deepcopy(value) for key, value in group.items() if key != "row_indices"}
+        for group in groups
+    ]
 
 
 def prepare_proxy_records(
@@ -191,12 +306,20 @@ def prepare_proxy_records(
     ``values``.  Optional fields are ``proxy_type``, ``target``, ``unit``,
     ``direction``, ``standardization`` (``zscore``, ``robust``, or ``none``),
     ``baseline_period``, ``measurement_error``, ``age_ensembles``, ``weight``,
-    ``site_weight``, ``chronology_group``, and ``record_id``.
+    ``site_weight``, ``chronology_group``, ``age_member_ids``, and ``record_id``.
+    Shared uncertain chronologies require explicit, unique ``age_member_ids``
+    with the same ID set in every record in that group. Unlabelled records are
+    independent even at the same site. Members are assumed equally probable.
 
     Raw values are retained in ``values``.  The transformed series is stored in
     ``standardized_values`` and is always oriented so larger values support the
     declared common target.  The function does not infer ecological meaning or
-    calibrate a proxy to climate.
+    calibrate a proxy to climate. Other input metadata is copied unchanged.
+    Both this result and its ``records`` can be passed back to the public
+    functions: raw values/errors are re-used, not transformed a second time.
+    ``scale`` is a derived numeric field, not an alias for ``standardization``.
+    Raw (``none``) records cannot be mixed with standardized records, and a
+    collection of raw records requires the same declared unit on every record.
     """
     if default_standardization not in _STANDARDIZATION_METHODS:
         raise ValueError(
@@ -215,6 +338,14 @@ def prepare_proxy_records(
         if not isinstance(raw, Mapping):
             raise ValueError(f"proxy_records[{index}] must be a mapping.")
         name = f"proxy_records[{index}]"
+        is_prepared = raw.get("_multi_proxy_prepared") == _PREPARATION_VERSION
+        if "_multi_proxy_prepared" in raw and not is_prepared:
+            raise ValueError(f"{name} has an unsupported prepared-record version.")
+        if "scale" in raw and not is_prepared:
+            raise ValueError(
+                f"{name}.scale is a derived field, no longer a standardization "
+                "alias; set standardization='zscore', 'robust', or 'none' explicitly."
+            )
         site_id = _text(raw.get("site_id"), f"{name}.site_id")
         proxy_id = _text(raw.get("proxy_id"), f"{name}.proxy_id")
         site_proxy = (site_id, proxy_id)
@@ -248,16 +379,24 @@ def prepare_proxy_records(
                     raise ValueError(
                         f"{name}.age_ensembles changes age direction relative to ages."
                     )
+        if age_ensembles is None and raw.get("age_member_ids") is not None:
+            raise ValueError(f"{name}.age_member_ids requires age_ensembles.")
+        member_ids = _age_member_ids(
+            raw.get("age_member_ids"),
+            0 if age_ensembles is None else len(age_ensembles),
+            f"{name}.age_member_ids",
+        )
 
-        standardization = raw.get("standardization", raw.get("scale", default_standardization))
-        standardization = str(standardization).lower()
-        baseline_period = raw.get("baseline_period")
-        transformed, location, scale = _standardize_values(
+        standardization = str(
+            raw.get("standardization", default_standardization)
+        ).strip().lower()
+        baseline_period = deepcopy(raw.get("baseline_period"))
+        standardized = _standardize_values(
             values, ages, standardization, baseline_period
         )
         direction = _direction(raw.get("direction", "positive"))
-        transformed = direction * transformed
-        raw_errors, errors = _measurement_error(raw, len(values), scale, name)
+        transformed = direction * standardized.values
+        raw_errors, errors = _measurement_error(raw, len(values), standardized.scale, name)
 
         record_id = _text(
             raw.get("record_id", f"{site_id}:{proxy_id}"), f"{name}.record_id"
@@ -278,8 +417,16 @@ def prepare_proxy_records(
         if not np.isfinite(site_weight) or site_weight < 0:
             raise ValueError(f"{name}.site_weight must be finite and non-negative.")
 
-        prepared.append(
+        chronology_group = raw.get("chronology_group")
+        if chronology_group is not None:
+            chronology_group = _text(chronology_group, f"{name}.chronology_group")
+
+        # Preserve source/method/sample_id/age_unit and arbitrary provenance,
+        # rather than relying on a whitelist that silently discards lineage.
+        record = deepcopy(dict(raw))
+        record.update(
             {
+                "_multi_proxy_prepared": _PREPARATION_VERSION,
                 "record_id": record_id,
                 "site_id": site_id,
                 "proxy_id": proxy_id,
@@ -292,18 +439,20 @@ def prepare_proxy_records(
                 "measurement_error_raw": raw_errors,
                 "measurement_error": errors,
                 "age_ensembles": None if age_ensembles is None else age_ensembles.copy(),
+                "age_member_ids": member_ids,
                 "direction": direction,
                 "standardization": standardization,
                 "baseline_period": baseline_period,
-                "location": location,
-                "scale": scale,
+                "location": standardized.location,
+                "scale": standardized.scale,
                 "weight": weight,
                 "site_weight": site_weight,
-                "chronology_group": raw.get("chronology_group", site_id),
+                "chronology_group": chronology_group,
                 "age_direction": age_direction,
                 "n_valid": int(np.isfinite(values).sum()),
             }
         )
+        prepared.append(record)
 
     if len(declared_targets) > 1:
         raise ValueError(
@@ -324,22 +473,47 @@ def prepare_proxy_records(
             raise ValueError("All record targets must match the requested target.")
         record["target"] = target
 
-    nonstandard_units = {
-        str(record["unit"]).strip()
-        for record in prepared
-        if record["standardization"] == "none" and record["unit"] is not None
-    }
-    if len(nonstandard_units) > 1:
+    methods = {record["standardization"] for record in prepared}
+    if "none" in methods and len(methods) > 1:
         raise ValueError(
-            "Records using standardization='none' must share a declared unit "
-            "or be calibrated to a common target before synthesis."
+            "Cannot mix raw standardization='none' records with standardized "
+            "zscore/robust records; choose a common analysis scale first."
         )
+    analysis_unit = "dimensionless"
+    if methods == {"none"}:
+        if any(
+            record["unit"] is not None and not isinstance(record["unit"], str)
+            for record in prepared
+        ):
+            raise ValueError(
+                "Raw record unit labels must be strings, not numeric/missing markers."
+            )
+        units = [
+            None if record["unit"] is None else record["unit"].strip()
+            for record in prepared
+        ]
+        if len(prepared) > 1 and (not all(units) or len(set(units)) != 1):
+            raise ValueError(
+                "Records using standardization='none' must all declare the same "
+                "unit, or be calibrated to a common unit before synthesis."
+            )
+        analysis_unit = units[0] or None
+
+    chronology_groups = _chronology_groups(prepared)
 
     return {
+        "_multi_proxy_prepared": _PREPARATION_VERSION,
         "records": prepared,
         "target": target,
         "site_ids": sorted({record["site_id"] for record in prepared}),
         "proxy_ids": sorted({record["proxy_id"] for record in prepared}),
+        "analysis_scale": "raw" if methods == {"none"} else "standardized",
+        "analysis_unit": analysis_unit,
+        "chronology_groups": _chronology_metadata(chronology_groups),
+        "chronology_assumptions": list(_CHRONOLOGY_ASSUMPTIONS),
+        "independent_chronology_records": [
+            record["record_id"] for record in prepared if record["chronology_group"] is None
+        ],
         "raw_values_preserved": True,
     }
 
@@ -349,13 +523,16 @@ def _record_weight(record: Mapping, weighting: str) -> float:
         return float(record["weight"])
     if weighting != "precision":
         raise ValueError("weighting must be 'equal' or 'precision'.")
+    if record["weight"] == 0:
+        return 0.0
     errors = np.asarray(record["measurement_error"], dtype=float)
-    finite = errors[np.isfinite(errors)]
-    positive = finite[finite > 0]
-    if len(positive) == 0:
-        precision = 1.0
-    else:
-        precision = 1.0 / float(np.median(positive) ** 2)
+    if np.any(~np.isfinite(errors)) or np.any(errors <= 0):
+        raise ValueError(
+            f"Record {record['record_id']!r}: weighting='precision' requires "
+            "explicit, strictly positive measurement errors; missing or zero "
+            "errors do not provide known precision. Use weighting='equal' instead."
+        )
+    precision = 1.0 / float(np.median(errors) ** 2)
     return float(record["weight"]) * precision
 
 
@@ -466,17 +643,16 @@ def _apply_measurement_noise(
 def _aligned_curves(
     records: Sequence[Mapping],
     time_grid: np.ndarray,
-    member_index: int,
     *,
-    propagate_age: bool,
+    age_member_indices: Optional[Mapping[str, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     curves = np.full((len(records), len(time_grid)), np.nan, dtype=float)
     error_curves = np.full_like(curves, np.nan)
     for index, record in enumerate(records):
         age_values = record["ages"]
         age_ensembles = record["age_ensembles"]
-        if propagate_age and age_ensembles is not None:
-            age_values = age_ensembles[member_index % len(age_ensembles)]
+        if age_member_indices is not None and record["record_id"] in age_member_indices:
+            age_values = age_ensembles[age_member_indices[record["record_id"]]]
         curves[index] = interpolate_no_extrapolation(
             age_values,
             record["standardized_values"],
@@ -629,17 +805,31 @@ def multi_proxy_synthesis(
     transformed to a common oriented target, interpolated independently, and
     combined within site.  Site composites are then combined regionally.  A
     site bootstrap resamples all proxies from a site together, preserving the
-    main within-archive dependence.  ``measurement_correlation`` optionally
+    main within-archive dependence. Sites with zero ``site_weight`` are excluded
+    from the bootstrap pool. Precision weighting requires declared positive
+    errors; absent or zero errors are not treated as known precision.
+    ``measurement_correlation`` optionally
     supplies a proxy-ID correlation matrix or pair mapping for standardized
     measurement errors within a site.
+
+    Chronology groups are sampled independently with replacement. Only an
+    explicitly shared ``chronology_group`` couples records, by matching
+    ``age_member_ids`` (not row numbers). Returned member indices refer to the
+    original rows and allow the joint draws to be audited. Coverage counts are
+    available sites per proxy/time bin at nominal ages, before weights and
+    resampling; ``valid_members_per_time`` reports regional ensemble support.
 
     This is a transparent common-target synthesis.  It requires the caller to
     justify why the proxies share a target and does not estimate a latent
     process, proxy productivity, or causal effect.
     """
     grid = as_float_array(time_grid, "time_grid", ndim=1, allow_nan=False)
-    if n_members < 1:
-        raise ValueError("n_members must be at least 1.")
+    if (
+        isinstance(n_members, (bool, np.bool_))
+        or not isinstance(n_members, (int, np.integer))
+        or n_members < 1
+    ):
+        raise ValueError("n_members must be a positive integer.")
     prepared_info = prepare_proxy_records(
         proxy_records,
         target=target,
@@ -666,13 +856,29 @@ def multi_proxy_synthesis(
     run_members = n_members if stochastic else 1
     rng = get_rng(random_state)
 
+    chronology_groups = _chronology_groups(records)
+    chronology_member_indices = {}
+    if propagate_age:
+        # One independent draw stream per group; the same canonical member is
+        # mapped back by identity for every record in a shared group. Drawing
+        # whole trajectories also preserves within-record age covariance.
+        for group in chronology_groups:
+            if group["n_available_members"]:
+                selected = rng.integers(
+                    0, group["n_available_members"], size=run_members
+                )
+                for record_id, rows in group["row_indices"].items():
+                    chronology_member_indices[record_id] = rows[selected]
+
     ensembles = []
     for member_index in range(run_members):
         curves, error_curves = _aligned_curves(
             records,
             grid,
-            member_index,
-            propagate_age=propagate_age,
+            age_member_indices={
+                record_id: int(rows[member_index])
+                for record_id, rows in chronology_member_indices.items()
+            },
         )
         if not propagate_measurement:
             error_curves = np.zeros_like(error_curves)
@@ -681,7 +887,8 @@ def multi_proxy_synthesis(
         )
         site_curves, site_weights, _ = _site_composites(curves, records, weighting)
         if bootstrap_sites:
-            selected = rng.integers(0, len(site_curves), size=len(site_curves))
+            eligible = np.flatnonzero(site_weights > 0)
+            selected = eligible[rng.integers(0, len(eligible), size=len(eligible))]
             regional = weighted_nanmean(site_curves[selected], site_weights[selected])
         else:
             regional = weighted_nanmean(site_curves, site_weights)
@@ -690,9 +897,7 @@ def multi_proxy_synthesis(
 
     # Build deterministic proxy-level curves for diagnostics.  These are not
     # additional independent evidence; they show coverage and disagreement.
-    diagnostic_curves, _ = _aligned_curves(
-        records, grid, 0, propagate_age=False
-    )
+    diagnostic_curves, _ = _aligned_curves(records, grid)
     by_proxy = defaultdict(list)
     by_proxy_weights = defaultdict(list)
     for index, record in enumerate(records):
@@ -701,24 +906,32 @@ def multi_proxy_synthesis(
             record["site_weight"] * _record_weight(record, weighting)
         )
     proxy_curves = {
-        proxy_id: weighted_nanmean(
-            np.asarray(by_proxy[proxy_id]),
-            np.asarray(by_proxy_weights[proxy_id], dtype=float),
+        proxy_id: (
+            weighted_nanmean(
+                np.asarray(by_proxy[proxy_id]),
+                np.asarray(by_proxy_weights[proxy_id], dtype=float),
+            )
+            if np.any(np.asarray(by_proxy_weights[proxy_id]) > 0)
+            else np.full(len(grid), np.nan)
         )
         for proxy_id in by_proxy
     }
     concordance = proxy_concordance(proxy_curves)
     proxy_coverage = {
-        proxy_id: np.sum(np.isfinite(curve), axis=0).astype(int)
-        for proxy_id, curve in proxy_curves.items()
+        proxy_id: np.sum(np.isfinite(np.asarray(curves)), axis=0).astype(int)
+        for proxy_id, curves in by_proxy.items()
     }
     effective_proxy_count = np.sum(
         np.isfinite(np.asarray(list(proxy_curves.values()))), axis=0
     )
-    diagnostic_site_curves, _, _ = _site_composites(
+    diagnostic_site_curves, diagnostic_site_weights, _ = _site_composites(
         diagnostic_curves, records, weighting
     )
-    effective_site_count = np.sum(np.isfinite(diagnostic_site_curves), axis=0)
+    effective_site_count = np.sum(
+        np.isfinite(diagnostic_site_curves) & (diagnostic_site_weights[:, None] > 0),
+        axis=0,
+    )
+    valid_members_per_time = np.sum(np.isfinite(ensembles_array), axis=0)
 
     if ensembles_array.shape[0] > 1:
         bands = np.full((3, ensembles_array.shape[1]), np.nan, dtype=float)
@@ -733,31 +946,20 @@ def multi_proxy_synthesis(
             "median": median,
             "upper": upper,
             "percentiles": (5, 50, 95),
+            "interval_type": "ensemble_percentile",
         }
         composite = median
     else:
         band = None
         composite = ensembles_array[0]
 
+    data_fields = {
+        "ages", "values", "standardized_values", "measurement_error_raw",
+        "measurement_error", "error", "proxy_error", "age_ensembles",
+        "_multi_proxy_prepared",
+    }
     metadata = [
-        {
-            key: record[key]
-            for key in (
-                "record_id",
-                "site_id",
-                "proxy_id",
-                "proxy_type",
-                "target",
-                "unit",
-                "direction",
-                "standardization",
-                "baseline_period",
-                "location",
-                "scale",
-                "n_valid",
-                "chronology_group",
-            )
-        }
+        {key: deepcopy(value) for key, value in record.items() if key not in data_fields}
         for record in records
     ]
     uncertainty_layers = []
@@ -774,6 +976,8 @@ def multi_proxy_synthesis(
         "uncertainty_band": band,
         "time_grid": grid,
         "target": prepared_info["target"],
+        "analysis_scale": prepared_info["analysis_scale"],
+        "analysis_unit": prepared_info["analysis_unit"],
         "method": "site_clustered_proxy_synthesis",
         "weighting": weighting,
         "n_members": int(ensembles_array.shape[0]),
@@ -785,10 +989,22 @@ def multi_proxy_synthesis(
         "record_metadata": metadata,
         "proxy_curves": proxy_curves,
         "proxy_coverage": proxy_coverage,
+        "coverage_basis": "available_sites_at_nominal_ages_before_weighting",
         "effective_proxy_count": effective_proxy_count,
         "effective_site_count": effective_site_count,
+        "valid_members_per_time": valid_members_per_time,
         "proxy_concordance": concordance,
         "uncertainty_layers": uncertainty_layers,
+        "measurement_error_model": (
+            "conditional Gaussian errors on the aligned grid; independent across time bins; "
+            "declared cross-proxy correlation within each site"
+            if has_measurement_uncertainty else "none propagated"
+        ),
+        "stochastic": bool(stochastic),
+        "chronology_groups": _chronology_metadata(chronology_groups),
+        "chronology_member_indices": chronology_member_indices,
+        "chronology_assumptions": prepared_info["chronology_assumptions"],
+        "independent_chronology_records": prepared_info["independent_chronology_records"],
         "bootstrap_unit": "site_cluster",
         "random_state": random_state if isinstance(random_state, int) else None,
         "raw_values_preserved": True,
@@ -806,7 +1022,14 @@ def leave_one_proxy_out(
     The default sensitivity run disables stochastic propagation so differences
     reflect proxy composition rather than different random draws.  Pass
     ``bootstrap_sites=True`` or uncertainty flags explicitly when a stochastic
-    leave-one-proxy-out distribution is desired.
+    leave-one-proxy-out distribution is desired. Such runs honor ``n_members``
+    (the synthesis default is 500). ``full`` retains the legacy composite
+    array; ``full_result`` and each exclusion also expose ensembles, percentile
+    bands, and actual member counts. Stochastic ``difference`` is a difference
+    of marginal medians, not a paired difference distribution or its interval.
+    If an exclusion removes the last uncertainty source, its distribution is
+    deterministic (repeated members, flagged ``distribution_degenerate``), not
+    an invented uncertainty layer.
     """
     raw_records = _record_iter(proxy_records)
     prepared = prepare_proxy_records(
@@ -817,12 +1040,12 @@ def leave_one_proxy_out(
     proxy_ids = prepared["proxy_ids"]
     if len(proxy_ids) < 2:
         raise ValueError("leave_one_proxy_out needs at least two proxy types.")
+    raw_records = prepared["records"]
 
     base_kwargs = dict(kwargs)
     base_kwargs.setdefault("bootstrap_sites", False)
     base_kwargs.setdefault("propagate_age", False)
     base_kwargs.setdefault("propagate_measurement", False)
-    base_kwargs["n_members"] = 1
     correlation_spec = base_kwargs.get("measurement_correlation")
     full_correlation = _correlation_matrix(proxy_ids, correlation_spec)
     proxy_positions = {proxy_id: i for i, proxy_id in enumerate(proxy_ids)}
@@ -841,10 +1064,29 @@ def leave_one_proxy_out(
                 if full_correlation[proxy_positions[left], proxy_positions[right]] != 0
             }
         result = multi_proxy_synthesis(subset, time_grid, **subset_kwargs)
+        if full["n_members"] > 1 and result["n_members"] == 1:
+            # A deterministic exclusion is a point-mass distribution, not a
+            # reason to discard the requested stochastic LOPO member count.
+            composite = result["composite"]
+            result["ensembles"] = np.repeat(
+                composite[None, :], full["n_members"], axis=0
+            )
+            result["n_members"] = full["n_members"]
+            result["valid_members_per_time"] = (
+                np.isfinite(composite).astype(int) * full["n_members"]
+            )
+            result["uncertainty_band"] = {
+                "lower": composite.copy(),
+                "median": composite.copy(),
+                "upper": composite.copy(),
+                "percentiles": (5, 50, 95),
+                "interval_type": "ensemble_percentile",
+            }
+            result["distribution_degenerate"] = True
         difference = result["composite"] - full["composite"]
         finite = np.isfinite(difference)
         exclusions[excluded] = {
-            "composite": result["composite"],
+            **result,
             "difference": difference,
             "rmse": (
                 float(np.sqrt(np.mean(difference[finite] ** 2)))
@@ -858,13 +1100,12 @@ def leave_one_proxy_out(
         }
     return {
         "full": full["composite"],
+        "full_result": full,
+        "n_members": full["n_members"],
         "time_grid": as_float_array(time_grid, "time_grid", ndim=1, allow_nan=False),
         "by_excluded_proxy": exclusions,
         "proxy_ids": proxy_ids,
         "method": "leave_one_proxy_out",
-        "stochastic": bool(
-            base_kwargs.get("bootstrap_sites")
-            or base_kwargs.get("propagate_age")
-            or base_kwargs.get("propagate_measurement")
-        ),
+        "stochastic": full["stochastic"],
+        "difference_definition": "difference_of_marginal_composites_not_paired_draws",
     }

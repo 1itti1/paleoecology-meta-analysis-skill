@@ -17,6 +17,8 @@ Do not interpret an absent taxon as a true zero without a detection rule.
 `consume_bacon_ages()` loads an externally generated age ensemble. The expected
 shape is `(members, samples)`, with one complete monotonic age curve per member.
 Validate the sample order and age direction before interpolation.
+Both comma CSV and whitespace tables are supported, with an optional `depth`
+column and one age-ensemble member per remaining column.
 
 `age_ensemble_from_errors()` perturbs dated horizons and enforces monotonicity.
 It is a sensitivity analysis, not a fitted chronology. The legacy
@@ -45,6 +47,8 @@ called separately. Never pad ragged records with zeros before interpolation.
 For multi-site continuous records, `composite_continuous_proxy()` accepts a list
 of per-site arrays and supports shared `(members, samples)` or per-site
 `(sites, members, samples)` age ensembles.
+Shared two-dimensional pools declare one common chronology. Per-site pools
+draw independently unless explicitly assigned to aligned chronology groups.
 
 ## 5. Spatial and preservation metadata
 

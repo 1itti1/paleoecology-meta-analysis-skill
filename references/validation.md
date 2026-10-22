@@ -42,3 +42,16 @@ These layers are only as credible as the supplied error model. Independent
 Gaussian noise is a convenience assumption, not a default law of proxy error.
 Record the layer actually used, the random seed, member count, and interval
 interpretation.
+
+`propagate_continuous_uncertainty()` keeps measured sample positions by default.
+Select `sampling_method='iid'` only when paired age/value observations can be
+treated as independent for the target. Degenerate resamples are counted and
+excluded, not silently repaired; finite member counts accompany each bin's
+quantiles. A bin supported by very few members is not equivalent to a bin with
+complete posterior support.
+
+Validate numerically meaningful invariants as well as output shapes: correct
+error scaling under unit changes, neutral zero-change indices, preservation of
+all-missing samples, independent chronology-group draws and reference-model
+agreement. See `tests/test_effect_models.py`, `test_multi_proxy.py`,
+`test_workflows.py`, and `test_analysis_contracts.py`.
